@@ -6,7 +6,11 @@ from fastapi import FastAPI
 from sqlalchemy import text
 from sqlalchemy.exc import SQLAlchemyError
 
+from app.api.errors import register_exception_handlers
 from app.api.health import router as health_router
+from app.api.middleware import RequestContextMiddleware
+from app.api.v1.admin import router as admin_router
+from app.api.v1.icd import router as icd_router
 from app.core.config import get_settings
 from app.core.database import dispose_engine, get_engine
 from app.core.logging import configure_logging
@@ -42,8 +46,12 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 def create_app() -> FastAPI:
     settings = get_settings()
     configure_logging(settings.log_level, settings.log_format)
-    app = FastAPI(title=settings.app_name, version="0.1.0", lifespan=lifespan)
+    app = FastAPI(title=settings.app_name, version="0.2.0", lifespan=lifespan)
+    app.add_middleware(RequestContextMiddleware)
+    register_exception_handlers(app)
     app.include_router(health_router)
+    app.include_router(icd_router)
+    app.include_router(admin_router)
     return app
 
 

@@ -26,3 +26,6 @@ data/sources/*
 .vscode/
 .DS_Store
 Thumbs.db
+
+# Regenerable synthetic fixtures (python -m app.synthetic.cli build)
+data/synthetic/

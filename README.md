@@ -1,74 +1,87 @@
 # icd-rag-service
 
-A standalone, version-aware ICD coding RAG service.
+A standalone, version-aware, evidence-backed ICD coding RAG backend.
 
-> **Status: Phase 1 — foundation only.** Database schema, migrations, health checks and dataset
-> registration exist. No ICD content is parsed, stored, embedded, retrieved or suggested yet.
+> **Status.** The system is implemented and verified end to end with **synthetic** data:
+> multi-format ingestion, validation, versioned PostgreSQL storage, hybrid retrieval (full-text
+> + trigram + pgvector), clinical concept extraction, rule and specificity validation, reranking,
+> and a suggestion API that re-verifies every code against the database.
+> **ICD-10-CA 2022 production data is pending a licensed dataset.** The CIHI PDF available
+> locally is copy-protected and its Terms of Use forbid extraction, so the system refuses it.
+> See [docs/licensing.md](docs/licensing.md).
 
-## 1. Purpose
-
-The service will eventually:
+## 1. What it does
 
 ```
-Clinical note
-  → (external system) extracts a documented clinical concept
-  → POST concept to this service
-  → retrieve candidate ICD codes, validate them against structured ICD data
-  → return explainable candidates
-  → (consuming application) user accepts/rejects, stores the accepted code
+licensed source file ─► adapters (PDF/text/CSV/TSV/XLSX/XML-ClaML/JSON) ─► normalized records
+   ─► validation (per coding system) ─► hierarchy ─► transactional import ─► search index
+clinical note ─► concept extraction (negation/uncertainty/history aware) ─► hybrid retrieval
+   ─► rules (excludes/includes/instructions) ─► specificity guard ─► rerank
+   ─► database re-verification ─► suggestions with evidence, alternatives, missing information
 ```
 
-The first target dataset is **ICD-10-CA 2022** (CIHI), sourced from `ICD10CA_2022_final.pdf`
-(classification) and `canadian-coding-standards-2022-en.pdf` (coding rules).
+| | |
+|---|---|
+| Supported classifications | Validators for **ICD-10**, **ICD-10-CA**, **ICD-10-CM**, and the synthetic **SYNTH-ICD**. More systems can be added through `register_validator`. |
+| Target version | ICD-10-CA **2022** (pending a licensed source). Any number of versions, languages and editions can coexist. |
+| Source formats | Text-layer PDF, optional OCR PDF (explicit only), structured text, CSV, TSV, XLSX, XML (generic + WHO ClaML), JSON |
+| Retrieval | Exact code, PostgreSQL full-text (weighted), pg_trgm fuzzy, source index terms, pgvector semantic, hierarchy context, configurable hybrid weights |
+| API | `/api/v1/icd/{datasets, search, codes, suggest}` plus token-protected admin endpoints |
 
-## 2. Architecture boundaries
+**Boundaries.** This service owns ICD dataset ingestion, structured storage, retrieval,
+validation, concept extraction for coding, and explainable suggestions. It does **not** store
+clinical notes. Suggestions are decision support, and a qualified coder makes the final choice.
+"Confidence" measures evidence and retrieval support, not diagnostic certainty.
 
-**This service owns:** ICD dataset ingestion, structured ICD knowledge storage, retrieval,
-ranking, validation and explainable code suggestions.
+## 2. Documentation
 
-**This service does NOT own:** clinical notes, patients, concept extraction, the human
-accept/reject decision, or persistence of accepted codes. Those belong to the consuming
-application. No external application is integrated.
-
-Design principles enforced by the schema:
-
-- **Every dataset is a first-class, versioned entity** (`icd_datasets`). Identity is
-  `(system, country, version, revision, edition, language)`, unique with `NULLS NOT DISTINCT`.
-- **Every knowledge row carries `dataset_id`.** Cross-row references (parent node, rule target,
-  index target, provenance links…) use composite foreign keys `(dataset_id, x_id) → (dataset_id, id)`,
-  so the database itself rejects any link between e.g. ICD-10-CA 2022 and ICD-10-CM rows.
-- **Relational data is authoritative.** `icd_search_documents.embedding` is a retrieval aid only;
-  a vector hit never establishes a valid code — codes are always re-verified against `icd_nodes`.
-- **Provenance is preserved** (`icd_source_refs`, `source_page*` columns).
-- **History is never deleted:** retired codes keep their row with `status = disabled`.
-- **Codes are free text** (no fixed length): Canadian 5th/6th-character extensions fit.
-- The **Alphabetical Index** (`icd_index_entries`, hierarchical) is stored separately from the
-  **Tabular List** (`icd_nodes`, `icd_terms`, `icd_rules`, `icd_relationships`).
+| Topic | Document |
+|---|---|
+| Architecture & decisions | [docs/architecture.md](docs/architecture.md) |
+| Ingestion pipeline, CLI, idempotency | [docs/ingestion.md](docs/ingestion.md) |
+| Source adapters & mappings (PDF details) | [docs/source-adapters.md](docs/source-adapters.md) |
+| Dataset identity, versions, lifecycle | [docs/dataset-versioning.md](docs/dataset-versioning.md) |
+| Retrieval & embeddings | [docs/retrieval.md](docs/retrieval.md) |
+| Reranking & confidence | [docs/reranking.md](docs/reranking.md) |
+| Rules, specificity, hallucination guard | [docs/coding-validation.md](docs/coding-validation.md) |
+| HTTP API | [docs/api.md](docs/api.md) |
+| Evaluation framework | [docs/evaluation.md](docs/evaluation.md) |
+| Security | [docs/security.md](docs/security.md) |
+| Licensing (read before ingesting real data) | [docs/licensing.md](docs/licensing.md) |
+| Verified runtime results | [docs/runtime-verification.md](docs/runtime-verification.md) |
 
 ### Layout
 
 ```
 app/
-  api/            HTTP routers (health.py; v1/ reserved for future ICD endpoints, currently empty)
-  core/           config, database engine/session, logging, constants/enums
-  models/         SQLAlchemy ORM models (one table per module)
-  repositories/   data access (dataset, health)
-  schemas/        Pydantic request/response models
-  services/       business logic (dataset registration)
-  main.py         FastAPI app + lifespan
-migrations/       Alembic environment + versioned migrations
-scripts/          operational scripts (register_dataset.py)
+  api/            routers (health, v1/icd, v1/admin), errors, middleware, deps
+  clinical/       rule-based concept extraction (status, attributes, abbreviations)
+  coding/         rules engine, specificity guard, reranker, suggestion service
+  core/           config, database, logging (request ids), constants, exceptions, text utils
+  evaluation/     metrics, runner, CLI
+  indexing/       search documents, embedding providers
+  ingestion/      adapters/, text/ (PDF pipeline), models, codes, hierarchy, validator,
+                  pipeline, importer, service, cli
+  models/         SQLAlchemy ORM
+  repositories/   SQL access (datasets, records/hierarchy, search, ingestion writes)
+  retrieval/      hybrid retriever
+  schemas/        API models
+  services/       dataset resolution, presenters
+  synthetic/      original synthetic ICD-like dataset, renderers for every format, eval cases
+migrations/       Alembic (0001 Phase 1 schema, 0002 ingestion/retrieval)
+scripts/          register_dataset.py, runtime_e2e.py
 tests/unit/       no database required
 tests/integration/ real PostgreSQL + pgvector; schema built by Alembic
-docker/           Dockerfile for the optional app/dev container
-data/sources/     place licensed source PDFs here (git-ignored)
+data/sources/     licensed source files (git-ignored)
+data/synthetic/   generated synthetic sources (git-ignored)
 ```
 
 ## 3. Technology stack
 
-Python 3.12 · FastAPI · Pydantic v2 / pydantic-settings · SQLAlchemy 2 (async) · asyncpg ·
-Alembic · PostgreSQL 15+ (17 recommended) · pgvector · pytest / pytest-asyncio · JSON logging.
-Local development is **Windows-native**; Docker is optional (see §11).
+Python 3.12 · FastAPI · Pydantic v2 · SQLAlchemy 2 (async) · asyncpg · Alembic ·
+PostgreSQL 15+ (17 recommended) · pgvector · pg_trgm · pdfplumber/pdfminer.six · openpyxl ·
+defusedxml · httpx · pytest. **Docker Compose is the verified workflow** (§10). Windows-native
+setup (§4–§9) is also supported where PostgreSQL + pgvector can be installed.
 
 ## 4. Prerequisites (Windows)
 
@@ -128,9 +141,12 @@ All settings are environment variables (see `.env.example`): `APP_NAME`, `APP_EN
 
 ## 6. Migrations
 
-The initial migration enables pgvector (`CREATE EXTENSION IF NOT EXISTS vector`) and creates all
-tables, indexes and constraints. If pgvector is not installed in PostgreSQL this step fails with
-`extension "vector" is not available` — install pgvector (§4) first.
+`0001` enables pgvector (`CREATE EXTENSION IF NOT EXISTS vector`) and creates the Phase 1 tables.
+`0002` enables `pg_trgm` and extends the schema in place for ingestion, provenance and
+retrieval. Existing rows are backfilled (`normalized_code`, the status mapping
+`ingesting → processing`), and its downgrade refuses to run if it would have to invent page
+numbers. If pgvector is not installed in PostgreSQL, the first step fails with
+`extension "vector" is not available`; install pgvector (§4) first.
 
 ```powershell
 alembic upgrade head        # apply
@@ -142,7 +158,9 @@ alembic upgrade head --sql  # print the SQL without a database
 ## 7. Register the ICD-10-CA 2022 dataset
 
 Creates the dataset **identity record only** (`status = pending`, no checksum). Nothing is parsed.
-Idempotent: a second run reports `"created": false` and returns the same row.
+Idempotent: a second run reports `"created": false` and returns the same row. Importing content is
+done with the ingestion CLI (§11) once a licensed source is available. The importer reuses this
+identity row.
 
 ```powershell
 python -m scripts.register_dataset
@@ -158,6 +176,8 @@ uvicorn app.main:app --reload --host 127.0.0.1 --port 8000
 |------------------|------------------------------------------------------------|
 | `GET /health`    | Liveness. `{"status":"ok","service":"icd-rag-service"}`    |
 | `GET /health/db` | Readiness: DB connection + pgvector installed. 503 if not. |
+| `/api/v1/icd/*`  | Datasets, search, code lookup/hierarchy, suggestions (§12, [docs/api.md](docs/api.md)) |
+| `/docs`          | OpenAPI UI                                                 |
 
 If the database is unreachable at startup, the app logs an error and still starts so `/health`
 works; `/health/db` returns `503` until the database is available.
@@ -179,45 +199,106 @@ to verify `upgrade head → downgrade base → upgrade head`, and another assert
 autogenerate finds no drift between the ORM models and the migrations. If PostgreSQL is
 unreachable, integration tests **fail** (they are never silently skipped).
 
-## 10. Optional: Docker
-
-`docker-compose.yml` and `docker/Dockerfile` are kept for optional/future deployment; local
-development does not need them. With Docker Desktop available:
+## 10. Docker (verified workflow)
 
 ```bash
 docker compose up -d db                                  # pgvector/pgvector:pg17
+docker compose build app
 docker compose run --rm app alembic upgrade head
 docker compose run --rm app pytest -v
-docker compose up -d app                                 # http://127.0.0.1:8000
+docker compose run --rm app ruff check . && docker compose run --rm app ruff format --check .
+docker compose run --rm app python -m scripts.runtime_e2e   # full E2E on its own database
+docker compose up -d app                                 # http://127.0.0.1:8000/docs
 ```
 
 Inside Compose the `app` service overrides `DATABASE_HOST=db`; outside Docker the default is
 `localhost`.
 
-## 11. Embeddings (design note)
+## 11. Ingesting data
 
-`icd_search_documents.embedding` is a **dimensionless** `vector` column because no embedding model
-has been chosen. `embedding_model` records which model produced a vector (a CHECK forbids a vector
-without it). When a model is selected, a new migration will:
+**Source files.** Put licensed source files in `data/sources/` (git-ignored). Restricted sources
+may be ingested only when the operator has the rights to do so
+([docs/licensing.md](docs/licensing.md)). Encrypted PDFs whose permissions forbid extraction are
+refused, and OCR is never used automatically.
 
-1. `ALTER TABLE icd_search_documents ALTER COLUMN embedding TYPE vector(<dim>)`
-2. create an HNSW index (`USING hnsw (embedding vector_cosine_ops)`), which requires a fixed dimension.
+```bash
+# Synthetic sources in every format, two versions, plus malformed and restricted samples
+python -m app.synthetic.cli build --out data/synthetic
 
-No embeddings are generated in Phase 1.
+# Inspect: hash, pages, encryption/permissions. No content is read.
+python -m app.ingestion.cli inspect --file data/synthetic/synth_2024_pdf.pdf
 
-## 12. Phase 1 limitations
+# Validate (dry run, no database): statistics + issues
+python -m app.ingestion.cli validate --file data/synthetic/synth_2024_pdf.pdf \
+    --manifest data/synthetic/synth_2024_pdf.pdf.manifest.json
 
-**NOT IMPLEMENTED YET:**
+# Import into PostgreSQL (transactional, idempotent) + search index + embeddings
+python -m app.ingestion.cli ingest --file data/synthetic/synth_2024_json.json \
+    --manifest data/synthetic/synth_2024_json.json.manifest.json --embed
 
-- PDF parser
-- ICD ingestion
-- chunk generation
-- embeddings
-- lexical/vector retrieval
-- reranking
-- coding rules engine
-- suggestion API (`POST /api/v1/icd/suggest` does not exist)
-- consuming application integration
+python -m app.ingestion.cli datasets
+python -m app.ingestion.cli index --dataset-id 1        # rebuild documents/embeddings
+```
 
-All ICD knowledge tables are empty by design; the only data this phase writes is the
-ICD-10-CA 2022 dataset identity record.
+`ingest` refuses to run without a recorded licence basis (`dataset.licence.basis` in the manifest
+or `--licence-basis "..."`). Manifests and field mappings for every format are described in
+[docs/source-adapters.md](docs/source-adapters.md).
+
+**When the licensed ICD-10-CA dataset arrives:** write a manifest (`coding_system: ICD-10-CA`,
+`version: 2022`, `country: CA`, `language`, `publisher`, licence basis) and a column/element
+mapping for the delivered format. Then run `validate`, review the statistics and issues, run the
+golden-sample comparison (licensed-dataset tasks in the implementation report), and `ingest`.
+
+## 12. Search and suggestions
+
+```bash
+curl "http://127.0.0.1:8000/api/v1/icd/search?coding_system=SYNTH-ICD&version=2024&q=acute%20heart%20failure"
+curl "http://127.0.0.1:8000/api/v1/icd/codes/A00?coding_system=SYNTH-ICD&version=2024"
+curl -X POST http://127.0.0.1:8000/api/v1/icd/suggest -H "Content-Type: application/json" \
+  -d '{"clinical_note":"Diagnosis: lobar consolidation of the left lung. Denies cough.","coding_system":"SYNTH-ICD","version":"2024","top_k":3}'
+```
+
+See [docs/api.md](docs/api.md) for the full request/response contract and error codes.
+
+## 13. Evaluation
+
+```bash
+python -m app.evaluation.cli run --synthetic --summary
+python -m app.evaluation.cli run --cases cases.jsonl --out report.json
+```
+
+Metrics are reported separately for concept extraction, retrieval, reranking and final selection
+([docs/evaluation.md](docs/evaluation.md)). Synthetic results validate **system behaviour only**.
+
+## 14. Configuration
+
+All settings are environment variables (see `.env.example`). Beyond the database settings (§5):
+`EMBEDDING_PROVIDER` (`hashing`|`openai`|`sentence-transformers`|`none`), `EMBEDDING_MODEL`,
+`EMBEDDING_DIMENSION`, `EMBEDDING_API_BASE_URL`, `EMBEDDING_API_KEY`, `RETRIEVAL_WEIGHT_*`,
+`RETRIEVAL_CANDIDATES_PER_METHOD`, `RETRIEVAL_FUZZY_THRESHOLD`, `MAX_TOP_K`,
+`CLINICAL_NOTE_MAX_CHARS`, `SUGGEST_UNCERTAIN_CONCEPTS`, `ADMIN_API_TOKEN`,
+`LOG_CLINICAL_TEXT` (debug only; refused in production). Optional extras:
+`pip install '.[ocr]'`, `pip install '.[local-embeddings]'`.
+
+## 15. Known limitations
+
+- **No real ICD-10-CA content.** Real extraction accuracy and coding accuracy are unmeasured
+  until a licensed dataset is supplied. All results so far come from synthetic data.
+- **The PDF layout profile is generic** (WHO tabular-list conventions). A real publication needs
+  its own profile and golden-sample validation. Layout heuristics have limits: wrapped titles
+  continue only after a comma, a connector word or an open parenthesis.
+- **Concept extraction is rule-based** (lexicons and cue phrases). It does not resolve
+  coreference or temporality beyond simple phrases, and it does not understand complex syntax.
+  Laterality needs an anatomical word within three words. Negation/uncertainty/history scope
+  ends at "but/however" or a new statement ("the patient has…"); other long-range scopes may
+  be missed.
+  The `ConceptExtractor` protocol allows an NLP/LLM replacement.
+- **The default `hashing` embeddings are lexical, not semantic.** Configure a real model for true
+  semantic similarity. Remote providers require licence permission.
+- **The rule engine** matches exclusions by word overlap (≥ 75%). It does not apply
+  dagger/asterisk pairing, sequencing logic or national coding standards (e.g. CIHI Canadian
+  Coding Standards are not ingested).
+- **ClaML `ModifierClass` expansion** is not supported.
+- **No Redis cache or rate limiter** is included. Hooks are in place (`rate_limit_hook`).
+- **The `icd_index_entries` hierarchy** (lead term → modifiers) is stored flat for source index
+  terms.

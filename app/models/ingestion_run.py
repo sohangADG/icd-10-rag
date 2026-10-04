@@ -68,9 +68,15 @@ class IcdIngestionRun(IdMixin, CreatedAtMixin, Base):
 
 
 class IcdIngestionError(IdMixin, CreatedAtMixin, Base):
-    """A single record-level failure within an ingestion run."""
+    """A single record-level validation issue or failure within an ingestion run.
+
+    `error_type` holds the validation issue code (e.g. DUPLICATE_CODE); `severity` is
+    ERROR / WARNING / INFO. Raw payloads never contain source content beyond the offending
+    record's identifiers.
+    """
 
     __tablename__ = "icd_ingestion_errors"
+    __table_args__ = (CheckConstraint("severity IN ('ERROR', 'WARNING', 'INFO')", name="severity"),)
 
     ingestion_run_id: Mapped[int] = mapped_column(
         BigInteger,
@@ -78,9 +84,13 @@ class IcdIngestionError(IdMixin, CreatedAtMixin, Base):
         nullable=False,
         index=True,
     )
+    severity: Mapped[str] = mapped_column(
+        String(16), nullable=False, default="ERROR", server_default="ERROR"
+    )
     source_page: Mapped[int | None] = mapped_column(Integer)
     entity_type: Mapped[str | None] = mapped_column(String(64))
     entity_identifier: Mapped[str | None] = mapped_column(Text)
     error_type: Mapped[str] = mapped_column(String(64), nullable=False)
     message: Mapped[str] = mapped_column(Text, nullable=False)
+    locator: Mapped[dict[str, Any] | None] = mapped_column(JSONB)
     raw_payload: Mapped[dict[str, Any] | None] = mapped_column(JSONB)

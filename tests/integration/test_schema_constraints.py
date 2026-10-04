@@ -319,6 +319,10 @@ async def test_search_document_without_embedding(session: AsyncSession) -> None:
 async def test_embedding_requires_model_name(session: AsyncSession) -> None:
     dataset = await make_dataset(session)
     unlabeled = IcdSearchDocument(
-        dataset_id=dataset.id, document_type="test", content="x", embedding=[0.0, 1.0]
+        dataset_id=dataset.id,
+        document_type="test",
+        content="x",
+        embedding=[0.0, 1.0],
+        embedding_dimension=2,
     )
     await _flush_rejected(session, unlabeled, "ck_icd_search_documents_embedding_has_model")
