@@ -19,7 +19,8 @@ from app.synthetic.dataset import (
     dataset_2025,
     malformed_records,
 )
-from app.synthetic.renderers import FORMAT_WRITERS, write_pdf
+from app.synthetic.paraphrase import DATASET_PARAPHRASE, paraphrase_chapters
+from app.synthetic.renderers import FORMAT_WRITERS, write_json, write_pdf
 
 
 def build(out: Path) -> list[str]:
@@ -35,6 +36,12 @@ def build(out: Path) -> list[str]:
             manifest_path = path.with_name(path.name + ".manifest.json")
             manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
             written += [path.name, manifest_path.name]
+
+    # Paraphrase dataset for semantic-retrieval tests (titles share no words with the queries).
+    paraphrase = out / "synth_paraphrase_json.json"
+    manifest = write_json(paraphrase, DATASET_PARAPHRASE, paraphrase_chapters())
+    (out / (paraphrase.name + ".manifest.json")).write_text(json.dumps(manifest, indent=2))
+    written += [paraphrase.name, paraphrase.name + ".manifest.json"]
 
     restricted = out / "synth_restricted_2024.pdf"
     manifest = write_pdf(restricted, DATASET_2024, CHAPTERS_2024, restricted=True)

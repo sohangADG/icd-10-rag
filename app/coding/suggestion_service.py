@@ -33,7 +33,12 @@ from app.core.text import normalize_text
 from app.indexing.embeddings import EmbeddingProvider
 from app.models import IcdDataset, IcdNode
 from app.repositories.icd_repository import IcdRepository
-from app.retrieval.hybrid import HybridRetriever, RetrievalCandidate, RetrievalFilters
+from app.retrieval.hybrid import (
+    HybridRetriever,
+    RetrievalCandidate,
+    RetrievalFilters,
+    SemanticStatus,
+)
 from app.schemas.icd import (
     Alternative,
     Suggestion,
@@ -102,13 +107,17 @@ class SuggestionService:
         settings: Settings,
         provider: EmbeddingProvider | None = None,
         *,
+        provider_status: SemanticStatus | None = None,
         extractor: ConceptExtractor | None = None,
         reranker: Reranker | None = None,
     ) -> None:
         self._session = session
         self._settings = settings
         self._records = IcdRepository(session)
-        self._retriever = HybridRetriever(session, settings, provider)
+        self._retriever = HybridRetriever(
+            session, settings, provider, provider_status=provider_status
+        )
+        self._semantic: dict[str, Any] = {}
         self._extractor = extractor or RuleBasedConceptExtractor()
         self._reranker = reranker or Reranker()
         self._rules = RuleEngine()
@@ -234,6 +243,10 @@ class SuggestionService:
         retrieval = await self._retriever.retrieve(
             dataset, queries_for(concept), top_k=CANDIDATE_POOL, filters=filters
         )
+        self._semantic = {
+            "semantic_status": retrieval.semantic_status.value,
+            "embedding_space": retrieval.embedding_space,
+        }
         if trace is not None:
             trace["retrieval_codes"] = [c.node.code for c in retrieval.candidates]
         evaluated = await self._evaluate(dataset, concept, others, retrieval.candidates)
@@ -389,8 +402,32 @@ class SuggestionService:
             if specificity.contradicted:
                 evaluated.reject_reasons += specificity.conflicts
             evaluated.reject_reasons += self._status_gate(concept, candidate.node, own)
+            if not rules.inclusion_match and not self._has_evidence(candidate):
+                evaluated.reject_reasons.append(
+                    "Insufficient retrieval evidence (no signal reaches the minimum: "
+                    f"lexical >= {self._settings.suggestion_min_lexical_evidence:.2f} or "
+                    f"exact/fuzzy/semantic/index term >= "
+                    f"{self._settings.suggestion_min_evidence:.2f})."
+                )
             results.append(evaluated)
         return results
+
+    def _has_evidence(self, candidate: RetrievalCandidate) -> bool:
+        """At least one retrieval signal is strong enough to support a suggestion.
+
+        Hierarchy context is never evidence on its own; lexical needs about half of the
+        concept's words; exact/fuzzy/semantic/index-term scores are already calibrated above
+        their noise floors.
+        """
+        scores = candidate.scores
+        minimum = self._settings.suggestion_min_evidence
+        return (
+            scores.lexical >= self._settings.suggestion_min_lexical_evidence
+            or scores.exact >= 1.0
+            or scores.fuzzy >= minimum
+            or scores.index_term >= minimum
+            or (scores.semantic or 0.0) >= minimum
+        )
 
     @staticmethod
     def _status_gate(concept: ClinicalConcept, node: IcdNode, own_terms: list[str]) -> list[str]:
@@ -723,9 +760,11 @@ class SuggestionService:
                 "retrieved_record_id": best.node.id,
                 "retrieved_code": best.node.code,
                 **best.candidate.scores.as_dict(),
+                "semantic_raw": best.candidate.scores.semantic_raw,
                 "hybrid": best.candidate.hybrid_score,
                 "rerank": best.rerank,
                 "rerank_features": best.features.as_dict(),
+                **self._semantic,
             },
             validation={
                 "db_verified": True,

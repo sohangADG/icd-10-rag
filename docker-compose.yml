@@ -36,9 +36,12 @@ services:
       - "127.0.0.1:${APP_PORT:-8000}:8000"
     volumes:
       - .:/app
+      # Downloaded embedding models persist here between runs (not in the repo or image).
+      - hf-cache:/opt/hf-cache
     depends_on:
       db:
         condition: service_healthy
 
 volumes:
   pgdata:
+  hf-cache:

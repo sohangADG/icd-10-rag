@@ -50,3 +50,19 @@ reranker move it to 1st, because no side is documented.
 > **These cases validate system behaviour only.** The synthetic classification was written for
 > this project, so its results say nothing about real ICD-10-CA coding accuracy. Real accuracy
 > must be measured with a licensed dataset and cases coded by qualified coders.
+
+## Retrieval comparison across embedding providers
+
+```bash
+python -m app.evaluation.cli compare --coding-system SYNTH-ICD --version paraphrase-1 \
+    --cases paraphrase --providers hashing,sentence_transformers --summary
+python -m app.evaluation.cli run --paraphrase --summary     # full suggestion pipeline
+```
+
+`compare` measures lexical-only, vector-only and hybrid retrieval per provider, with Recall@k,
+MRR, top-1 and latency. It re-embeds the dataset for each provider, and the last provider stays
+active. The paraphrase suite (`app/synthetic/paraphrase.py`) is original synthetic data in which
+no query shares a word stem with its target title; a test enforces this. Only semantic
+retrieval can solve it. Results are in
+[runtime-verification.md §7](runtime-verification.md#7-semantic-embeddings-2026-10-04). They
+validate system behaviour only.

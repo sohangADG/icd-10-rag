@@ -4,6 +4,7 @@ from typing import Any
 from pgvector.sqlalchemy import Vector
 from sqlalchemy import (
     BigInteger,
+    Boolean,
     CheckConstraint,
     DateTime,
     ForeignKey,
@@ -35,8 +36,9 @@ class IcdSearchDocument(IdMixin, TimestampMixin, Base):
     `embedding` stays a dimensionless pgvector column: the embedding model is configurable, and
     each vector is labelled with its model and dimension. ANN search uses per-model partial HNSW
     expression indexes over `embedding::vector(<dim>)` created by the indexer.
-    `embedding_content_hash` records the content the vector was computed from, so unchanged
-    documents are never re-embedded.
+    `embedding_content_hash` hashes the embedding space (provider, model, dimension,
+    normalisation) together with `semantic_text`, so unchanged documents are never re-embedded
+    and any change of text or space triggers regeneration.
     """
 
     __tablename__ = "icd_search_documents"
@@ -59,6 +61,16 @@ class IcdSearchDocument(IdMixin, TimestampMixin, Base):
         CheckConstraint(
             "embedding IS NULL OR embedding_dimension IS NOT NULL", name="embedding_has_dimension"
         ),
+        CheckConstraint(
+            "embedding IS NULL OR (embedding_provider IS NOT NULL "
+            "AND embedding_normalized IS NOT NULL)",
+            name="embedding_has_space",
+        ),
+        # The database itself refuses a vector whose length differs from its declared dimension.
+        CheckConstraint(
+            "embedding IS NULL OR vector_dims(embedding) = embedding_dimension",
+            name="embedding_dimension_matches",
+        ),
     )
 
     dataset_id: Mapped[int] = mapped_column(
@@ -68,13 +80,18 @@ class IcdSearchDocument(IdMixin, TimestampMixin, Base):
     document_type: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
     content: Mapped[str] = mapped_column(Text, nullable=False)
     content_hash: Mapped[str | None] = mapped_column(String(64))
+    # Exactly the text that is embedded: positive retrieval evidence only (no exclusions, no
+    # instructions naming other conditions, no subdivision list). See app/indexing/indexer.py.
+    semantic_text: Mapped[str | None] = mapped_column(Text)
     search_vector: Mapped[str | None] = mapped_column(TSVECTOR)
     # "metadata" is reserved on declarative classes, so the attribute is named differently.
     metadata_: Mapped[dict[str, Any]] = mapped_column(
         "metadata", JSONB, nullable=False, default=dict, server_default="{}"
     )
     embedding: Mapped[list[float] | None] = mapped_column(Vector())
+    embedding_provider: Mapped[str | None] = mapped_column(String(64))
     embedding_model: Mapped[str | None] = mapped_column(String(128), index=True)
+    embedding_normalized: Mapped[bool | None] = mapped_column(Boolean)
     embedding_dimension: Mapped[int | None] = mapped_column(Integer)
     embedding_content_hash: Mapped[str | None] = mapped_column(String(64))
     embedded_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))

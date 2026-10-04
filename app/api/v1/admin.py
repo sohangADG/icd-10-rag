@@ -9,11 +9,10 @@ from typing import Annotated, Any
 from fastapi import APIRouter, Depends
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.api.deps import embedding_provider, require_admin
+from app.api.deps import ProviderHandle, embedding_provider, require_admin
 from app.core.constants import DatasetStatus
 from app.core.database import get_session
 from app.core.exceptions import DatasetNotFound, DatasetNotReady
-from app.indexing.embeddings import EmbeddingProvider
 from app.ingestion.service import IngestionService
 from app.repositories.dataset_repository import DatasetRepository
 
@@ -24,9 +23,9 @@ router = APIRouter(prefix="/api/v1/admin", tags=["admin"], dependencies=[Depends
 async def reindex(
     dataset_id: int,
     session: Annotated[AsyncSession, Depends(get_session)],
-    provider: Annotated[EmbeddingProvider | None, Depends(embedding_provider)],
+    provider: Annotated[ProviderHandle, Depends(embedding_provider)],
 ) -> dict[str, Any]:
-    result = await IngestionService(session, provider).reindex(dataset_id)
+    result = await IngestionService(session, provider.provider).reindex(dataset_id)
     return {"dataset_id": dataset_id, **result}
 
 

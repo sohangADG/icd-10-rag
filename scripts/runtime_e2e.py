@@ -26,11 +26,14 @@ from sqlalchemy import pool, text
 from sqlalchemy.ext.asyncio import create_async_engine
 
 from app.core.config import get_settings
+from app.indexing.embeddings import get_embedding_provider
 from app.synthetic.cli import build
+from app.synthetic.paraphrase import PARAPHRASE_PAIRS
 
 ROOT = Path(__file__).resolve().parents[1]
 PORT = 8100
 CHECKS: list[dict[str, Any]] = []
+EXPECTED: dict[str, Any] = {}
 
 
 def check(name: str, condition: bool, detail: Any = None) -> None:
@@ -92,7 +95,17 @@ def main() -> int:
     config.attributes["configure_logger"] = False
     command.upgrade(config, "head")
     version = asyncio.run(query(database, "SELECT version_num FROM alembic_version"))
-    check("fresh database migrated to head", version == [("0002",)], version)
+    check("fresh database migrated to head", version == [("0003",)], version)
+
+    provider = get_embedding_provider(settings)
+    EXPECTED["space"] = (
+        (provider.provider_name, provider.model, provider.dimension) if provider else None
+    )
+    check(
+        "configured embedding provider loads (dimension read from the model)",
+        provider is not None,
+        EXPECTED["space"],
+    )
 
     # 2. synthetic sources + CLI ingestion ----------------------------------------------------
     sources = Path(tempfile.mkdtemp(prefix="e2e_"))
@@ -131,6 +144,28 @@ def main() -> int:
         "ingest synthetic 2025 JSON (+embeddings)",
         code == 0 and report["import"]["status"] == "imported",
     )
+    code, report = cli(env, "ingest", *src("synth_paraphrase_json.json"), "--embed")
+    embeddings = report.get("embeddings") or {}
+    check(
+        "ingest synthetic paraphrase dataset (+semantic embeddings)",
+        code == 0 and report["import"]["status"] == "imported" and embeddings.get("failed") == 0,
+        {
+            k: embeddings.get(k)
+            for k in (
+                "provider",
+                "model",
+                "dimension",
+                "documents",
+                "embedded",
+                "skipped_unchanged",
+                "failed",
+                "embed_ms",
+                "write_ms",
+                "duration_ms",
+                "vector_index",
+            )
+        },
+    )
     code, report = cli(env, "ingest", *src("synth_2024_pdf.pdf"))
     check(
         "re-ingest identical source is skipped",
@@ -153,6 +188,16 @@ def main() -> int:
         "re-index skips unchanged embeddings",
         code == 0 and report["embeddings"]["embedded"] == 0,
         report["embeddings"],
+    )
+    code, report = cli(
+        env, "index", "--dataset-id", str(pdf_dataset_id), "--force", "--batch-size", "16"
+    )
+    check(
+        "forced re-index regenerates every embedding in batches",
+        code == 0
+        and report["embeddings"]["embedded"] == report["embeddings"]["documents"]
+        and report["embeddings"]["batches"] >= 4,
+        {k: report["embeddings"][k] for k in ("embedded", "batches", "embed_ms", "write_ms")},
     )
 
     # 3. real HTTP server ---------------------------------------------------------------------
@@ -182,6 +227,7 @@ def main() -> int:
                 except httpx.TransportError:
                     time.sleep(0.5)
             run_http_checks(http)
+            run_semantic_http_checks(http)
     finally:
         server.terminate()
         server.wait(timeout=10)
@@ -205,6 +251,70 @@ def main() -> int:
     return 1 if failed else 0
 
 
+def run_semantic_http_checks(http: httpx.Client) -> None:
+    """Paraphrase queries share no word with their target: only semantics can find them."""
+    ds = {"coding_system": "SYNTH-ICD", "version": "paraphrase-1"}
+    found, shown = 0, []
+    for code, _title, query in PARAPHRASE_PAIRS:
+        body = http.get("/api/v1/icd/search", params={**ds, "q": query, "limit": 3}).json()
+        top = body["results"][0] if body["results"] else {}
+        found += top.get("code") == code
+        shown.append(
+            {
+                "query": query,
+                "expected": code,
+                "top": top.get("code"),
+                "record_id": top.get("record_id"),
+                "semantic": top.get("scores", {}).get("semantic"),
+                "semantic_raw": top.get("scores", {}).get("semantic_raw"),
+                "lexical": top.get("scores", {}).get("lexical"),
+                "hybrid": top.get("hybrid_score"),
+                "status": body["semantic_status"],
+                "model": (body.get("embedding_space") or {}).get("model"),
+            }
+        )
+    check(
+        "semantic hybrid search over HTTP (paraphrases, zero word overlap)",
+        found >= 0.85 * len(PARAPHRASE_PAIRS) and all(r["status"] == "ok" for r in shown),
+        {"top1": f"{found}/{len(PARAPHRASE_PAIRS)}", "results": shown[:6]},
+    )
+    response = http.post(
+        "/api/v1/icd/suggest",
+        json={"clinical_note": "Assessment: epilepsy. Denies hay fever.", **ds, "top_k": 3},
+    )
+    body = response.json()
+    suggestion = body["suggestions"][0] if body["suggestions"] else {}
+    scores = suggestion.get("retrieval_scores", {})
+    check(
+        "suggestion pipeline with real semantic retrieval (epilepsy -> P07)",
+        response.status_code == 200
+        and [s["code"] for s in body["suggestions"]] == ["P07"]
+        and scores.get("semantic_status") == "ok"
+        and suggestion.get("validation", {}).get("db_verified") is True,
+        {
+            "code": suggestion.get("code"),
+            "title": suggestion.get("title"),
+            "confidence": suggestion.get("confidence"),
+            "scores": {
+                k: scores.get(k)
+                for k in (
+                    "exact",
+                    "lexical",
+                    "fuzzy",
+                    "semantic",
+                    "semantic_raw",
+                    "hierarchy",
+                    "hybrid",
+                    "rerank",
+                )
+            },
+            "unmatched": [
+                (u["clinical_concept"], u["concept_status"]) for u in body["unmatched_concepts"]
+            ],
+        },
+    )
+
+
 def run_http_checks(http: httpx.Client) -> None:
     ds = {"coding_system": "SYNTH-ICD", "version": "2024"}
     health = http.get("/health/db").json()
@@ -213,7 +323,12 @@ def run_http_checks(http: httpx.Client) -> None:
     check(
         "GET /api/v1/icd/datasets",
         {(d["version"], d["status"]) for d in datasets["datasets"]}
-        == {("2024", "ready"), ("2025", "ready"), ("malformed", "validation_failed")},
+        == {
+            ("2024", "ready"),
+            ("2025", "ready"),
+            ("paraphrase-1", "ready"),
+            ("malformed", "validation_failed"),
+        },
         [(d["version"], d["status"]) for d in datasets["datasets"]],
     )
 
@@ -354,14 +469,18 @@ def run_db_checks(database: str) -> None:
         "SELECT id, version, status, source_checksum IS NOT NULL, source_page_count "
         "FROM icd_datasets ORDER BY id"
     )
-    check("dataset rows (hash, status, version)", len(rows) == 3, rows)
+    check(
+        "dataset rows (hash, status, version)",
+        len(rows) == 4 and all(r[3] for r in rows),
+        rows,
+    )
     counts = q(
         "SELECT d.version, count(n.id) FROM icd_datasets d LEFT JOIN icd_nodes n "
         "ON n.dataset_id = d.id GROUP BY d.version ORDER BY 1"
     )
     check(
         "records persisted per dataset",
-        dict(counts) == {"2024": 55, "2025": 55, "malformed": 0},
+        dict(counts) == {"2024": 55, "2025": 55, "paraphrase-1": 17, "malformed": 0},
         counts,
     )
     duplicates = q(
@@ -384,18 +503,32 @@ def run_db_checks(database: str) -> None:
     )
     check("coding rules persisted (type, count, resolved targets)", len(rules) >= 5, rules)
     embeddings = q(
-        "SELECT embedding_model, embedding_dimension, count(*) FROM icd_search_documents "
-        "WHERE embedding IS NOT NULL GROUP BY 1, 2"
+        "SELECT embedding_provider, embedding_model, embedding_dimension, count(*), "
+        "bool_and(vector_dims(embedding) = embedding_dimension), bool_and(embedding_normalized) "
+        "FROM icd_search_documents WHERE embedding IS NOT NULL GROUP BY 1, 2, 3"
     )
+    expected = EXPECTED["space"]
     check(
-        "embeddings stored with model + dimension",
-        embeddings and embeddings[0][2] == 110,
+        "embeddings stored with provider + model + real dimension",
+        len(embeddings) == 1
+        and embeddings[0][:3] == expected
+        and embeddings[0][3] == 55 + 55 + 17
+        and embeddings[0][4] is True
+        and embeddings[0][5] is True,
         embeddings,
     )
     hnsw = q(
-        "SELECT indexname FROM pg_indexes WHERE indexname LIKE 'ix_icd_search_documents_hnsw_%'"
+        "SELECT indexname, indexdef FROM pg_indexes "
+        "WHERE indexname LIKE 'ix_icd_search_documents_hnsw_%'"
     )
-    check("HNSW vector index exists", len(hnsw) == 1, hnsw)
+    check(
+        "HNSW index matches the space (cosine opclass, provider/model/dimension predicate)",
+        len(hnsw) == 1
+        and "vector_cosine_ops" in hnsw[0][1]
+        and f"vector({expected[2]})" in hnsw[0][1]
+        and "embedding_provider" in hnsw[0][1],
+        hnsw[0][0] if hnsw else None,
+    )
     trgm = q("SELECT indexname FROM pg_indexes WHERE indexname LIKE '%trgm'")
     check("pg_trgm indexes exist", len(trgm) == 3, [r[0] for r in trgm])
     suggested = next(c["detail"] for c in CHECKS if c["check"] == "_suggested_codes")

@@ -52,25 +52,34 @@ class IngestionService:
             index_stats = await self.embed(outcome.dataset_id)
         return result, outcome, index_stats
 
-    async def embed(self, dataset_id: int) -> IndexStats:
-        """(Re)generate embeddings for changed documents of a READY dataset."""
+    async def embed(
+        self, dataset_id: int, *, force: bool = False, batch_size: int | None = None
+    ) -> IndexStats:
+        """(Re)generate embeddings of a READY dataset: only documents whose semantic text or
+        embedding space changed, or all of them with `force`. Batches are committed one by one
+        (restart-safe); the dataset itself is never re-imported."""
         dataset = await DatasetRepository(self._session).get(dataset_id)
         if dataset is None:
             raise DatasetNotFound(f"Dataset {dataset_id} does not exist")
         if dataset.status != DatasetStatus.READY:
             raise DatasetNotReady(f"Dataset {dataset_id} is {dataset.status.value}, not ready")
+        settings = get_settings()
         indexer = SearchIndexer(self._session, self._provider)
-        try:
-            stats = await indexer.embed_documents(
-                dataset, batch_size=get_settings().embedding_batch_size
-            )
-            await self._session.commit()
-        except Exception:
-            await self._session.rollback()
-            raise
-        return stats
+        return await indexer.embed_documents(
+            dataset,
+            batch_size=batch_size or settings.embedding_batch_size,
+            force=force,
+            distance=settings.embedding_distance,
+        )
 
-    async def reindex(self, dataset_id: int, *, embed: bool = True) -> dict[str, Any]:
+    async def reindex(
+        self,
+        dataset_id: int,
+        *,
+        embed: bool = True,
+        force: bool = False,
+        batch_size: int | None = None,
+    ) -> dict[str, Any]:
         """Rebuild search documents (and embeddings) of a READY dataset from relational data."""
         repository = DatasetRepository(self._session)
         dataset = await repository.get(dataset_id)
@@ -84,5 +93,9 @@ class IngestionService:
         except Exception:
             await self._session.rollback()
             raise
-        stats = await self.embed(dataset_id) if embed and self._provider else None
+        stats = (
+            await self.embed(dataset_id, force=force, batch_size=batch_size)
+            if embed and self._provider
+            else None
+        )
         return {"documents": documents, "embeddings": asdict(stats) if stats else None}

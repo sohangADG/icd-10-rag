@@ -1,22 +1,29 @@
 """Build the retrieval representation of a dataset: one search document per ICD entity.
 
-Each document carries code, title, description, hierarchy path, inclusion terms, source
-synonyms/index terms, notes, parent and child context and dataset metadata, and keeps the
-authoritative record_id (node_id) and dataset_id.
+Retrieval unit = one logical ICD record (chapter, block, category, code); never an arbitrary
+chunk of source text. Each document keeps the authoritative record_id (node_id) and dataset_id.
 
-Lexical index: weighted tsvector (A: code/title/synonyms/index terms, B: inclusions/description,
-C: hierarchy/notes/children). Exclusion text is shown in `content` (clearly labelled) but kept
-out of the tsvector and the embedding input, so a query never matches a code through what that
-code excludes.
+Three views of each record are produced:
+* `content`: display/context text (title, description, hierarchy, inclusions, terms, notes,
+  instructions, subdivisions, exclusions clearly labelled, dataset).
+* `search_vector` (lexical): A = code/title/synonyms/abbreviations/index terms,
+  B = inclusions/description/inherited parent terms, C = hierarchy/notes/subdivision titles.
+* `semantic_text` (embedded): positive evidence only: code + title, description, hierarchy
+  path, inclusions, synonyms/abbreviations/index terms, inherited parent terms, notes.
 
-Embeddings are optional, computed only for new/changed content, and labelled with model and
-dimension. Remote providers are refused unless the dataset's licence metadata allows it.
+Exclusions and instructions that name *other* conditions (code first / use additional code /
+code also / see / see also) are kept out of both the lexical index and the semantic text, so a
+query never matches a record through a condition it excludes or merely refers to. They remain
+available to the rule engine.
+
+Embeddings are computed per embedding space (provider, model, dimension, normalisation), only
+for new or changed semantic text, in committed batches. Remote providers are refused unless the
+dataset's licence metadata allows it.
 """
 
 import hashlib
 import json
 import logging
-import re
 import time
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -26,24 +33,27 @@ from sqlalchemy import select, text, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.constants import SEARCH_DOCUMENT_TYPE_RECORD, RuleType, TermType
-from app.core.exceptions import LicenceRestrictionError
+from app.core.exceptions import EmbeddingProviderError, LicenceRestrictionError
 from app.core.text import ts_config_for
 from app.indexing.embeddings import EmbeddingProvider
+from app.indexing.vector_space import Distance, VectorSpace
 from app.models import IcdDataset, IcdIndexEntry, IcdNode, IcdRule, IcdSearchDocument, IcdTerm
-from app.models.search_document import HNSW_INDEX_PREFIX
 
 logger = logging.getLogger(__name__)
 
 MAX_CHILDREN_IN_CONTEXT = 25
-HNSW_MAX_DIMENSION = 2000  # pgvector limit for HNSW on `vector`
 _EXCLUDES_PREFIX = "Excludes:"
+# Rule types whose text is positive evidence about the record itself. Other instruction
+# types name *other* conditions and stay out of the lexical and semantic representations.
+_SELF_DESCRIBING_RULES = {RuleType.NOTE, RuleType.INCLUDE}
 
 _UPSERT_SQL = text(
     """
     INSERT INTO icd_search_documents
-        (dataset_id, node_id, document_type, content, content_hash, metadata, search_vector)
+        (dataset_id, node_id, document_type, content, content_hash, semantic_text, metadata,
+         search_vector)
     VALUES (
-        :dataset_id, :node_id, :document_type, :content, :content_hash,
+        :dataset_id, :node_id, :document_type, :content, :content_hash, :semantic_text,
         CAST(:metadata AS jsonb),
         setweight(to_tsvector(CAST(:cfg AS regconfig), :weight_a), 'A')
         || setweight(to_tsvector(CAST(:cfg AS regconfig), :weight_b), 'B')
@@ -52,6 +62,7 @@ _UPSERT_SQL = text(
     ON CONFLICT ON CONSTRAINT uq_icd_search_documents_dataset_node_type DO UPDATE SET
         content = EXCLUDED.content,
         content_hash = EXCLUDED.content_hash,
+        semantic_text = EXCLUDED.semantic_text,
         metadata = EXCLUDED.metadata,
         search_vector = EXCLUDED.search_vector,
         updated_at = now()
@@ -59,13 +70,13 @@ _UPSERT_SQL = text(
 )
 
 
-def embedding_text(content: str) -> str:
-    """The embedded text: the document content minus exclusion lines."""
-    return "\n".join(line for line in content.split("\n") if not line.startswith(_EXCLUDES_PREFIX))
-
-
 def sha256_text(value: str) -> str:
     return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
+def embedding_identity(space: VectorSpace, semantic_text: str) -> str:
+    """Deterministic identity of one stored vector: embedding space + embedded text."""
+    return sha256_text(f"{space.key}\n{semantic_text}")
 
 
 def allows_remote_processing(dataset: IcdDataset) -> bool:
@@ -77,10 +88,20 @@ def allows_remote_processing(dataset: IcdDataset) -> bool:
 
 @dataclass
 class IndexStats:
+    provider: str | None = None
+    model: str | None = None
+    dimension: int | None = None
+    normalized: bool | None = None
+    distance: str | None = None
+    documents: int = 0
     embedded: int = 0
-    embedding_skipped_unchanged: int = 0
-    embedding_model: str | None = None
+    skipped_unchanged: int = 0
+    skipped_empty: int = 0
+    failed: int = 0
+    batches: int = 0
     vector_index: str | None = None
+    embed_ms: int = 0
+    write_ms: int = 0
     duration_ms: int = 0
 
 
@@ -157,7 +178,10 @@ class SearchIndexer:
         index_terms = data["index_terms"].get(node.id, [])
         node_rules = data["rules"].get(node.id, [])
         exclusions = [t for r, t in node_rules if r == RuleType.EXCLUDE]
-        notes = [t for r, t in node_rules if r != RuleType.EXCLUDE]
+        notes = [t for r, t in node_rules if r in _SELF_DESCRIBING_RULES]
+        instructions = [
+            t for r, t in node_rules if r != RuleType.EXCLUDE and r not in _SELF_DESCRIBING_RULES
+        ]
         kids = children.get(node.id, [])
         hierarchy = " > ".join(self._label(p) for p in path)
         # Source synonyms/abbreviations/index terms of classification ancestors describe their
@@ -187,7 +211,10 @@ class SearchIndexer:
         if inherited:
             lines.append("Parent terms: " + "; ".join(dict.fromkeys(inherited)))
         if notes:
-            lines.append("Instructions: " + " | ".join(notes))
+            lines.append("Notes: " + " | ".join(notes))
+        semantic_text = "\n".join(lines)  # positive evidence only (see module docstring)
+        if instructions:
+            lines.append("Instructions: " + " | ".join(instructions))
         if kids:
             lines.append(
                 "Subdivisions: " + "; ".join(self._label(k) for k in kids[:MAX_CHILDREN_IN_CONTEXT])
@@ -224,6 +251,7 @@ class SearchIndexer:
             "document_type": SEARCH_DOCUMENT_TYPE_RECORD,
             "content": content,
             "content_hash": sha256_text(content),
+            "semantic_text": semantic_text,
             "metadata": json.dumps(metadata),
             "cfg": ts_config_for(dataset.language),
             "weight_a": " ".join(
@@ -258,100 +286,169 @@ class SearchIndexer:
 
     # --- embeddings -----------------------------------------------------------------------
 
-    async def embed_documents(self, dataset: IcdDataset, *, batch_size: int = 64) -> IndexStats:
-        stats = IndexStats()
+    async def embed_documents(
+        self,
+        dataset: IcdDataset,
+        *,
+        batch_size: int = 32,
+        force: bool = False,
+        distance: Distance = "cosine",
+        commit: bool = True,
+    ) -> IndexStats:
+        """Embed new/changed documents of a dataset in batches.
+
+        Skips a document when its stored vector belongs to the same embedding space and was
+        computed from the same semantic text (unless `force`). Each batch is written and (with
+        `commit`) committed on its own, so an interrupted run resumes where it stopped: committed
+        batches are skipped next time. A provider failure or a vector of the wrong length rolls
+        back the current batch only, records the failed count and raises EmbeddingProviderError.
+        """
         provider = self._provider
         if provider is None:
-            return stats
+            return IndexStats()
         if provider.remote and not allows_remote_processing(dataset):
             raise LicenceRestrictionError(
                 f"Dataset {dataset.system} {dataset.version} does not allow remote processing; "
                 "refusing to send its content to a remote embedding provider.",
                 details={"dataset_id": dataset.id},
             )
+        space = VectorSpace.of(provider, distance)
+        stats = IndexStats(
+            provider=space.provider,
+            model=space.model,
+            dimension=space.dimension,
+            normalized=space.normalized,
+            distance=space.distance,
+        )
+        dataset_id = dataset.id
         started = time.perf_counter()
         rows = (
             await self._session.execute(
                 select(
                     IcdSearchDocument.id,
-                    IcdSearchDocument.content,
+                    IcdSearchDocument.semantic_text,
+                    IcdSearchDocument.embedding_content_hash,
+                    IcdSearchDocument.embedding_provider,
                     IcdSearchDocument.embedding_model,
                     IcdSearchDocument.embedding_dimension,
-                    IcdSearchDocument.embedding_content_hash,
-                ).where(IcdSearchDocument.dataset_id == dataset.id)
+                    IcdSearchDocument.embedding_normalized,
+                )
+                .where(IcdSearchDocument.dataset_id == dataset_id)
+                .order_by(IcdSearchDocument.id)
             )
         ).all()
+        stats.documents = len(rows)
         pending: list[tuple[int, str, str]] = []
-        for doc_id, content, model, dimension, content_hash in rows:
-            source = embedding_text(content)
-            # Identity is (model, dimension, text): the same model name at another dimension
-            # (e.g. OpenAI `dimensions`) is a different embedding space and is re-embedded.
-            source_hash = sha256_text(f"{provider.model}:{provider.dimension}:{source}")
-            if (
-                model == provider.model
-                and dimension == provider.dimension
-                and content_hash == source_hash
-            ):
-                stats.embedding_skipped_unchanged += 1
+        for doc_id, semantic, stored_hash, prov, model, dim, normalized in rows:
+            if not (semantic or "").strip():
+                stats.skipped_empty += 1
                 continue
-            pending.append((doc_id, source, source_hash))
-        for start in range(0, len(pending), batch_size):
-            batch = pending[start : start + batch_size]
-            vectors = await provider.embed([source for _, source, _ in batch])
-            now = datetime.now(UTC)
-            # ORM bulk UPDATE by primary key: one executemany per batch.
-            await self._session.execute(
-                update(IcdSearchDocument),
-                [
-                    {
-                        "id": doc_id,
-                        "embedding": vector,
-                        "embedding_model": provider.model,
-                        "embedding_dimension": provider.dimension,
-                        "embedding_content_hash": source_hash,
-                        "embedded_at": now,
-                    }
-                    for (doc_id, _, source_hash), vector in zip(batch, vectors, strict=True)
-                ],
+            identity = embedding_identity(space, semantic)
+            same_space = (prov, model, dim, normalized) == (
+                space.provider,
+                space.model,
+                space.dimension,
+                space.normalized,
             )
+            if not force and same_space and stored_hash == identity:
+                stats.skipped_unchanged += 1
+                continue
+            pending.append((doc_id, semantic, identity))
+
+        batches = [pending[i : i + batch_size] for i in range(0, len(pending), batch_size)]
+        for number, batch in enumerate(batches, start=1):
+            try:
+                t0 = time.perf_counter()
+                vectors = await provider.embed([text_ for _, text_, _ in batch])
+                stats.embed_ms += int((time.perf_counter() - t0) * 1000)
+                for vector in vectors:
+                    if len(vector) != space.dimension:  # providers check too; never store
+                        raise EmbeddingProviderError(
+                            f"Vector of length {len(vector)} for a {space.dimension}-dimensional "
+                            "space"
+                        )
+                t1 = time.perf_counter()
+                now = datetime.now(UTC)
+                await self._session.execute(
+                    update(IcdSearchDocument),
+                    [
+                        {
+                            "id": doc_id,
+                            "embedding": vector,
+                            "embedding_provider": space.provider,
+                            "embedding_model": space.model,
+                            "embedding_dimension": space.dimension,
+                            "embedding_normalized": space.normalized,
+                            "embedding_content_hash": identity,
+                            "embedded_at": now,
+                        }
+                        for (doc_id, _, identity), vector in zip(batch, vectors, strict=True)
+                    ],
+                )
+                if commit:
+                    await self._session.commit()
+                stats.write_ms += int((time.perf_counter() - t1) * 1000)
+            except Exception as exc:
+                await self._session.rollback()
+                stats.failed = len(pending) - stats.embedded
+                logger.error(
+                    "embedding batch failed; earlier batches are kept and will be skipped on retry",
+                    extra={
+                        "dataset_id": dataset_id,
+                        "batch": number,
+                        "batches": len(batches),
+                        "failed": stats.failed,
+                        "error_type": type(exc).__name__,
+                    },
+                )
+                if isinstance(exc, EmbeddingProviderError):
+                    raise
+                raise EmbeddingProviderError(
+                    f"Embedding failed in batch {number}/{len(batches)} ({type(exc).__name__})",
+                    details={"embedded": stats.embedded, "failed": stats.failed},
+                ) from exc
             stats.embedded += len(batch)
-        stats.embedding_model = provider.model
-        stats.vector_index = await self.ensure_vector_index(provider.model, provider.dimension)
+            stats.batches += 1
+            logger.info(
+                "embedding batch stored",
+                extra={
+                    "dataset_id": dataset_id,
+                    "batch": number,
+                    "batches": len(batches),
+                    "embedded": stats.embedded,
+                    "pending": len(pending) - stats.embedded,
+                },
+            )
+        stats.vector_index = await self.ensure_vector_index(space)
+        if commit:
+            await self._session.commit()
         stats.duration_ms = int((time.perf_counter() - started) * 1000)
         logger.info(
             "embeddings generated",
             extra={
-                "dataset_id": dataset.id,
-                "embedding_model": provider.model,
+                "dataset_id": dataset_id,
+                "embedding_provider": space.provider,
+                "embedding_model": space.model,
+                "dimension": space.dimension,
                 "embedded": stats.embedded,
-                "skipped_unchanged": stats.embedding_skipped_unchanged,
+                "skipped_unchanged": stats.skipped_unchanged,
+                "skipped_empty": stats.skipped_empty,
                 "duration_ms": stats.duration_ms,
             },
         )
         return stats
 
-    async def ensure_vector_index(self, model: str, dimension: int) -> str | None:
-        """Partial HNSW expression index for one (model, dimension). Idempotent.
+    async def ensure_vector_index(self, space: VectorSpace) -> str | None:
+        """Partial HNSW index for one embedding space and distance. Idempotent.
 
-        The predicate includes the dimension, so rows of another dimension can never reach the
-        `::vector(dim)` cast (which would fail) and queries must filter on both columns.
+        Its predicate is the space predicate the queries use, so rows of another space never
+        reach its `::vector(dim)` cast, and its operator class matches the query operator.
         """
-        if dimension > HNSW_MAX_DIMENSION:
+        if not space.indexable:
             logger.warning(
                 "embedding dimension exceeds HNSW limit; vector search will scan",
-                extra={"embedding_model": model, "dimension": dimension},
+                extra={"embedding_model": space.model, "dimension": space.dimension},
             )
             return None
-        slug = hashlib.sha1(f"{model}:{dimension}:dimension-scoped".encode()).hexdigest()[:12]
-        name = f"{HNSW_INDEX_PREFIX}{slug}"
-        literal = model.replace("'", "''")
-        if not re.fullmatch(r"[a-z0-9_]+", name):  # defensive: identifiers are interpolated
-            raise ValueError("invalid index name")
-        await self._session.execute(
-            text(
-                f"CREATE INDEX IF NOT EXISTS {name} ON icd_search_documents "
-                f"USING hnsw ((embedding::vector({int(dimension)})) vector_cosine_ops) "
-                f"WHERE embedding_model = '{literal}' AND embedding_dimension = {int(dimension)}"
-            )
-        )
-        return name
+        await self._session.execute(text(space.create_index_sql()))
+        return space.index_name

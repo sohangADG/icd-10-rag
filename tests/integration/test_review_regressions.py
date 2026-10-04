@@ -147,7 +147,7 @@ async def test_changing_dimension_re_embeds_instead_of_mixing(
     first = await SearchIndexer(session, _SharedNameProvider(32)).embed_documents(dataset)
     assert first.embedded == 55
     second = await SearchIndexer(session, _SharedNameProvider(64)).embed_documents(dataset)
-    assert second.embedded == 55 and second.embedding_skipped_unchanged == 0
+    assert second.embedded == 55 and second.skipped_unchanged == 0
     dims = set(
         (
             await session.execute(

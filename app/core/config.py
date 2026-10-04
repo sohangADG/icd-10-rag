@@ -1,7 +1,7 @@
 from functools import lru_cache
 from typing import Literal
 
-from pydantic import Field, SecretStr, model_validator
+from pydantic import Field, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from sqlalchemy.engine import URL, make_url
 
@@ -32,15 +32,42 @@ class Settings(BaseSettings):
     database_connect_timeout_seconds: float = Field(default=5.0, gt=0)
 
     # --- embeddings (provider-independent; see docs/retrieval.md) ---------------------------
-    # none | hashing (local, deterministic) | openai (OpenAI-compatible HTTP API) |
-    # sentence-transformers (local model, optional extra)
-    embedding_provider: Literal["none", "hashing", "openai", "sentence-transformers"] = "hashing"
-    embedding_model: str = "hashing-v1"
-    embedding_dimension: int = Field(default=256, ge=8, le=4096)
+    # sentence_transformers (local semantic model, default) | openai (OpenAI-compatible HTTP
+    # API) | hashing (deterministic lexical hashing, for tests) | none (semantic disabled)
+    embedding_provider: Literal["none", "hashing", "openai", "sentence_transformers"] = (
+        "sentence_transformers"
+    )
+    # Development default: a compact general-purpose English retrieval model (384 dimensions,
+    # MIT licence). Replace with a medical-domain model by configuration only.
+    embedding_model: str = "BAAI/bge-small-en-v1.5"
+    # Expected vector dimension. Optional for models that report their own dimension (the
+    # model's actual dimension is always used and must match this when set). The hashing
+    # provider uses 256 when unset; OpenAI-compatible providers require it.
+    embedding_dimension: int | None = Field(default=None, ge=8, le=4096)
+    embedding_device: str = "cpu"
+    embedding_batch_size: int = Field(default=32, ge=1, le=2048)
+    # L2-normalise every vector (documents and queries alike), so cosine == dot product.
+    embedding_normalize: bool = True
+    # Distance used by the HNSW index *and* the query operator (always the same pair).
+    embedding_distance: Literal["cosine", "l2", "inner_product"] = "cosine"
+    # Prefix added to queries only (asymmetric models, e.g. BGE/E5 instructions).
+    embedding_query_prefix: str = ""
+    # Similarity at or below which the semantic score is 0 (calibrates model-specific
+    # similarity baselines onto 0..1). Unset: the provider's documented default.
+    embedding_similarity_floor: float | None = Field(default=None, ge=-1, lt=1)
+    # In-process LRU of query embeddings keyed by a hash of the query (0 disables).
+    embedding_query_cache_size: int = Field(default=256, ge=0, le=100_000)
     embedding_api_base_url: str = "https://api.openai.com/v1"
     embedding_api_key: SecretStr | None = None
-    embedding_batch_size: int = Field(default=64, ge=1, le=2048)
     embedding_timeout_seconds: float = Field(default=30.0, gt=0)
+    # optional: semantic problems degrade to exact/lexical/fuzzy retrieval (reported per
+    # request); required: such requests fail with RETRIEVAL_ERROR (503).
+    semantic_retrieval_mode: Literal["optional", "required"] = "optional"
+
+    @field_validator("embedding_provider", mode="before")
+    @classmethod
+    def _provider_alias(cls, value: object) -> object:
+        return value.replace("-", "_") if isinstance(value, str) else value
 
     # --- retrieval / suggestion ---------------------------------------------------------------
     retrieval_weight_exact: float = Field(default=0.30, ge=0)
@@ -54,6 +81,13 @@ class Settings(BaseSettings):
     max_top_k: int = Field(default=20, ge=1, le=100)
     clinical_note_max_chars: int = Field(default=20_000, ge=100, le=200_000)
     suggest_uncertain_concepts: bool = True
+    # A candidate is only suggested when at least one retrieval signal (exact, lexical, fuzzy,
+    # semantic, index term) reaches this normalised score; weaker matches are reported as
+    # "insufficient retrieval evidence" instead of being guessed.
+    suggestion_min_evidence: float = Field(default=0.15, ge=0, le=1)
+    # Lexical evidence counts only when about half of the concept's words are covered
+    # (0.75 * coverage + 0.25 * density >= 0.4): one shared generic word is not evidence.
+    suggestion_min_lexical_evidence: float = Field(default=0.4, ge=0, le=1)
 
     # --- security -----------------------------------------------------------------------------
     # Admin endpoints are disabled unless a token is configured.

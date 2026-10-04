@@ -1,26 +1,56 @@
 """Shared FastAPI dependencies."""
 
 import hmac
-from functools import lru_cache
+import logging
+from dataclasses import dataclass
 from typing import Annotated
 
 from fastapi import Depends, Header
 
 from app.core.config import Settings, get_settings
-from app.core.exceptions import AppError
+from app.core.exceptions import AppError, EmbeddingProviderError
 from app.indexing.embeddings import EmbeddingProvider, get_embedding_provider
+from app.retrieval.hybrid import SemanticStatus
+
+logger = logging.getLogger(__name__)
 
 
-@lru_cache
-def _provider(settings_id: int) -> EmbeddingProvider | None:  # noqa: ARG001 - cache key
-    return get_embedding_provider(get_settings())
+@dataclass(frozen=True)
+class ProviderHandle:
+    """The process-wide embedding provider, or why there is none."""
+
+    provider: EmbeddingProvider | None
+    status: SemanticStatus
 
 
-def embedding_provider(
-    settings: Annotated[Settings, Depends(get_settings)],
-) -> EmbeddingProvider | None:
-    """Process-wide provider instance (models may be expensive to load)."""
-    return _provider(id(settings))
+_handles: dict[int, tuple[Settings, ProviderHandle]] = {}
+
+
+def load_provider(settings: Settings) -> ProviderHandle:
+    """Load (once per settings object) the configured provider. A provider that cannot be
+    loaded (missing model, no network on first download...) is reported, not raised: requests
+    then degrade or fail according to SEMANTIC_RETRIEVAL_MODE."""
+    cached = _handles.get(id(settings))
+    if cached is not None and cached[0] is settings:
+        return cached[1]
+    if settings.embedding_provider == "none":
+        handle = ProviderHandle(None, SemanticStatus.DISABLED)
+    else:
+        try:
+            handle = ProviderHandle(get_embedding_provider(settings), SemanticStatus.OK)
+        except EmbeddingProviderError as exc:
+            logger.error(
+                "embedding provider could not be loaded",
+                extra={"embedding_provider": settings.embedding_provider, "error": exc.message},
+            )
+            handle = ProviderHandle(None, SemanticStatus.PROVIDER_UNAVAILABLE)
+    _handles[id(settings)] = (settings, handle)
+    return handle
+
+
+def embedding_provider(settings: Annotated[Settings, Depends(get_settings)]) -> ProviderHandle:
+    """Process-wide provider (models are expensive to load)."""
+    return load_provider(settings)
 
 
 class AdminDisabled(AppError):

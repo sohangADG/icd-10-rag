@@ -68,7 +68,7 @@ app/
   schemas/        API models
   services/       dataset resolution, presenters
   synthetic/      original synthetic ICD-like dataset, renderers for every format, eval cases
-migrations/       Alembic (0001 Phase 1 schema, 0002 ingestion/retrieval)
+migrations/       Alembic (0001 Phase 1 schema, 0002 ingestion/retrieval, 0003 embedding spaces)
 scripts/          register_dataset.py, runtime_e2e.py
 tests/unit/       no database required
 tests/integration/ real PostgreSQL + pgvector; schema built by Alembic
@@ -208,6 +208,7 @@ docker compose run --rm app alembic upgrade head
 docker compose run --rm app pytest -v
 docker compose run --rm app ruff check . && docker compose run --rm app ruff format --check .
 docker compose run --rm app python -m scripts.runtime_e2e   # full E2E on its own database
+docker compose run --rm -e RUN_SEMANTIC_MODEL_TESTS=1 app pytest -m semantic_model  # real model
 docker compose up -d app                                 # http://127.0.0.1:8000/docs
 ```
 
@@ -273,12 +274,28 @@ Metrics are reported separately for concept extraction, retrieval, reranking and
 ## 14. Configuration
 
 All settings are environment variables (see `.env.example`). Beyond the database settings (§5):
-`EMBEDDING_PROVIDER` (`hashing`|`openai`|`sentence-transformers`|`none`), `EMBEDDING_MODEL`,
-`EMBEDDING_DIMENSION`, `EMBEDDING_API_BASE_URL`, `EMBEDDING_API_KEY`, `RETRIEVAL_WEIGHT_*`,
+`EMBEDDING_PROVIDER` (`sentence_transformers` default | `openai` | `hashing` | `none`),
+`EMBEDDING_MODEL` (default `BAAI/bge-small-en-v1.5`), `EMBEDDING_DIMENSION` (optional, validated
+against the model), `EMBEDDING_DEVICE`, `EMBEDDING_BATCH_SIZE`, `EMBEDDING_NORMALIZE`,
+`EMBEDDING_DISTANCE`, `EMBEDDING_QUERY_PREFIX`, `EMBEDDING_SIMILARITY_FLOOR`,
+`EMBEDDING_QUERY_CACHE_SIZE`, `SEMANTIC_RETRIEVAL_MODE` (`optional`|`required`),
+`EMBEDDING_API_BASE_URL`, `EMBEDDING_API_KEY`, `RETRIEVAL_WEIGHT_*`,
 `RETRIEVAL_CANDIDATES_PER_METHOD`, `RETRIEVAL_FUZZY_THRESHOLD`, `MAX_TOP_K`,
-`CLINICAL_NOTE_MAX_CHARS`, `SUGGEST_UNCERTAIN_CONCEPTS`, `ADMIN_API_TOKEN`,
-`LOG_CLINICAL_TEXT` (debug only; refused in production). Optional extras:
-`pip install '.[ocr]'`, `pip install '.[local-embeddings]'`.
+`CLINICAL_NOTE_MAX_CHARS`, `SUGGEST_UNCERTAIN_CONCEPTS`, `SUGGESTION_MIN_EVIDENCE`,
+`SUGGESTION_MIN_LEXICAL_EVIDENCE`, `ADMIN_API_TOKEN`, `LOG_CLINICAL_TEXT` (debug only; refused
+in production). Optional extra: `pip install '.[ocr]'`.
+
+### Semantic embeddings
+
+The default provider runs a local sentence-transformers model (`BAAI/bge-small-en-v1.5`, 384 dimensions, read from the model) on CPU. Outside Docker, install
+CPU-only PyTorch first (`pip install torch --index-url https://download.pytorch.org/whl/cpu`).
+The model is downloaded on first use into the Hugging Face cache (`HF_HOME`; in Docker the
+`hf-cache` volume) and never committed. To switch model or provider, change the configuration
+and rebuild embeddings without re-importing: `python -m app.ingestion.cli index --dataset-id N
+[--provider ...] [--model ...] [--batch-size ...] [--force]`. Compare providers on synthetic data
+with `python -m app.evaluation.cli compare --coding-system SYNTH-ICD --version paraphrase-1`. The
+test suite uses the deterministic `hashing` provider; the real-model tests run with
+`RUN_SEMANTIC_MODEL_TESTS=1`. Details: [docs/retrieval.md](docs/retrieval.md).
 
 ## 15. Known limitations
 
@@ -293,8 +310,14 @@ All settings are environment variables (see `.env.example`). Beyond the database
   ends at "but/however" or a new statement ("the patient has…"); other long-range scopes may
   be missed.
   The `ConceptExtractor` protocol allows an NLP/LLM replacement.
-- **The default `hashing` embeddings are lexical, not semantic.** Configure a real model for true
-  semantic similarity. Remote providers require licence permission.
+- **The default semantic model is a small general-English model** (`bge-small-en-v1.5`), not a
+  medical one. On the synthetic paraphrase set it gets top-1 0.93 retrieval. Near-ties occur
+  (e.g. "insomnia"), and those are abstained on by the evidence gate. The similarity floor (0.6)
+  is calibrated for this model on synthetic data and must be re-measured for any other model. A
+  medical-domain model can be substituted by configuration. Remote providers require licence
+  permission.
+- **One active embedding space per dataset**: switching model or provider re-embeds the dataset.
+  Vectors of two models are never kept side by side for the same document.
 - **The rule engine** matches exclusions by word overlap (≥ 75%). It does not apply
   dagger/asterisk pairing, sequencing logic or national coding standards (e.g. CIHI Canadian
   Coding Standards are not ingested).

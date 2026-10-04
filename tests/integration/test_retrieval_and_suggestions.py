@@ -93,7 +93,8 @@ async def test_lexical_retrieval_via_source_synonym(
     result = await _retriever(session).retrieve(dataset, ["hypertension"], top_k=3)
     top = result.candidates[0]
     assert top.node.code == "B00"
-    assert top.scores.lexical == 1.0 and top.scores.index_term == 1.0
+    # Absolute lexical scale: full query coverage (0.75) + rank density.
+    assert top.scores.lexical >= 0.75 and top.scores.index_term == 1.0
     assert ("SYNONYM", "hypertension") in {(m.match_type, m.matched_text) for m in top.evidence}
 
 
@@ -194,7 +195,7 @@ async def test_embeddings_are_not_regenerated_for_unchanged_content(
 ) -> None:
     indexer = SearchIndexer(session, get_embedding_provider(get_settings()))
     stats = await indexer.embed_documents(dataset)
-    assert stats.embedded == 0 and stats.embedding_skipped_unchanged == 55
+    assert stats.embedded == 0 and stats.skipped_unchanged == 55
 
 
 async def test_remote_embedding_requires_licence_permission(

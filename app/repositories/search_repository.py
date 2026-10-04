@@ -12,7 +12,9 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.constants import SEARCH_DOCUMENT_TYPE_RECORD
 from app.core.exceptions import RetrievalError
+from app.indexing.vector_space import VectorSpace
 from app.ingestion.codes import clean_code, normalize_code
+from app.retrieval.scoring import lexical_score
 
 
 @dataclass(frozen=True)
@@ -55,8 +57,9 @@ class SearchRepository:
         limit: int,
         node_ids: Sequence[int] | None = None,
     ) -> dict[int, float]:
-        """Full-text score = 0.5 * normalised ts_rank_cd + 0.5 * coverage of the query's
-        lexemes by the document's high-weight (A/B) lexemes."""
+        """Absolute full-text score (app.retrieval.scoring.lexical_score): coverage of the
+        query's lexemes by the record's high-weight (A/B) lexemes plus ts_rank_cd density.
+        Independent of which other documents matched, so scores are comparable everywhere."""
         rows = await self._session.execute(
             text(
                 f"""
@@ -81,7 +84,7 @@ class SearchRepository:
                   AND d.document_type = '{SEARCH_DOCUMENT_TYPE_RECORD}'
                   AND d.search_vector @@ tq.tsq
                   {"AND d.node_id = ANY(:node_ids)" if node_ids is not None else ""}
-                ORDER BY rank DESC
+                ORDER BY coverage DESC, rank DESC
                 LIMIT :limit
                 """
             ),
@@ -93,14 +96,7 @@ class SearchRepository:
                 **({"node_ids": list(node_ids)} if node_ids is not None else {}),
             },
         )
-        results = rows.all()
-        if not results:
-            return {}
-        best = max(row.rank for row in results) or 1.0
-        return {
-            row.node_id: round(0.5 * (row.rank / best) + 0.5 * min(row.coverage, 1.0), 4)
-            for row in results
-        }
+        return {row.node_id: lexical_score(row.rank, row.coverage) for row in rows}
 
     async def _set_trigram_thresholds(self, threshold: float) -> None:
         await self._session.execute(
@@ -204,58 +200,73 @@ class SearchRepository:
             for row in rows
         ]
 
-    async def embedded_models(self, dataset_id: int) -> set[tuple[str, int]]:
-        """(model, dimension) pairs that have vectors in this dataset."""
-        rows = await self._session.execute(
-            text(
-                """
-                SELECT DISTINCT embedding_model, embedding_dimension AS dim
-                FROM icd_search_documents
-                WHERE dataset_id = :dataset_id AND embedding IS NOT NULL
-                """
-            ),
-            {"dataset_id": dataset_id},
-        )
-        return {(row.embedding_model, int(row.dim)) for row in rows}
+    async def space_coverage(self, dataset_id: int, space: VectorSpace) -> tuple[int, int]:
+        """(record documents embedded in `space`, total record documents) for a dataset."""
+        row = (
+            await self._session.execute(
+                text(
+                    f"""
+                    SELECT count(*) FILTER (WHERE embedding IS NOT NULL AND {space.predicate_sql()})
+                               AS embedded,
+                           count(*) AS total
+                    FROM icd_search_documents
+                    WHERE dataset_id = :dataset_id
+                      AND document_type = '{SEARCH_DOCUMENT_TYPE_RECORD}'
+                      -- Documents without semantic text are never embedded: not part of coverage.
+                      AND coalesce(btrim(semantic_text), '') <> ''
+                    """
+                ),
+                {"dataset_id": dataset_id},
+            )
+        ).one()
+        return int(row.embedded), int(row.total)
 
     async def semantic(
         self,
         dataset_id: int,
-        model: str,
-        dimension: int,
+        space: VectorSpace,
         query_vector: Sequence[float],
         *,
         limit: int,
         node_ids: Sequence[int] | None = None,
     ) -> dict[int, float]:
-        """Cosine similarity via the per-(model, dimension) HNSW expression index."""
-        dim = int(dimension)
-        if len(query_vector) != dim:
-            raise RetrievalError(f"Query vector has {len(query_vector)} dimensions, expected {dim}")
-        # pgvector >= 0.8: keep scanning the HNSW graph until enough rows pass the filters.
+        """Raw vector similarity within one embedding space (HNSW index of that space).
+
+        Filters by dataset and by the full space predicate (provider, model, dimension,
+        normalisation), so vectors of different models are never compared. The ORDER BY uses the
+        same operator as the space's index.
+        """
+        if len(query_vector) != space.dimension:
+            raise RetrievalError(
+                f"Query vector has {len(query_vector)} dimensions, expected {space.dimension}"
+            )
+        # pgvector >= 0.8: keep scanning the HNSW graph until enough rows pass the filters, and
+        # widen the candidate list (default 40) for better recall on these bounded queries.
         await self._session.execute(
-            text("SELECT set_config('hnsw.iterative_scan', 'relaxed_order', true)")
+            text(
+                "SELECT set_config('hnsw.iterative_scan', 'relaxed_order', true), "
+                "set_config('hnsw.ef_search', :ef, true)"
+            ),
+            {"ef": str(max(100, limit))},
         )
         rows = await self._session.execute(
             text(
                 f"""
-                SELECT node_id,
-                       1 - (embedding::vector({dim}) <=> CAST(:qv AS vector({dim}))) AS similarity
+                SELECT node_id, {space.similarity_sql()} AS similarity
                 FROM icd_search_documents
-                WHERE dataset_id = :dataset_id AND embedding_model = :model
-                  AND embedding_dimension = {dim}
+                WHERE dataset_id = :dataset_id
                   AND document_type = '{SEARCH_DOCUMENT_TYPE_RECORD}'
+                  AND embedding IS NOT NULL AND {space.predicate_sql()}
                   {"AND node_id = ANY(:node_ids)" if node_ids is not None else ""}
-                ORDER BY embedding::vector({dim}) <=> CAST(:qv AS vector({dim}))
+                ORDER BY {space.distance_sql()}
                 LIMIT :limit
                 """
             ),
             {
                 "dataset_id": dataset_id,
-                "model": model,
                 "qv": _vector_literal(query_vector),
                 "limit": limit,
                 **({"node_ids": list(node_ids)} if node_ids is not None else {}),
             },
         )
-        return {row.node_id: max(0.0, float(row.similarity)) for row in rows}
+        return {row.node_id: float(row.similarity) for row in rows}

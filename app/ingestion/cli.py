@@ -25,15 +25,16 @@ from typing import Any
 
 from sqlalchemy.ext.asyncio import async_sessionmaker
 
-from app.core.config import get_settings
+from app.core.config import Settings, get_settings
 from app.core.database import create_engine_from_settings
-from app.core.exceptions import AppError
+from app.core.exceptions import AppError, DatasetNotFound
 from app.core.logging import configure_logging
 from app.indexing.embeddings import get_embedding_provider
 from app.ingestion.adapters import AdapterError, SourceManifest, select_adapter
 from app.ingestion.pipeline import PipelineResult
 from app.ingestion.service import IngestionService
 from app.repositories.dataset_repository import DatasetRepository
+from app.services.dataset_resolver import DatasetResolver
 
 _IDENTITY_FLAGS = ("coding_system", "version", "country", "language", "publisher", "edition")
 
@@ -143,20 +144,51 @@ def cmd_ingest(args: argparse.Namespace) -> int:
     return 0 if outcome.status in {"imported", "skipped"} else 1
 
 
+def _index_settings(args: argparse.Namespace) -> Settings:
+    """Configuration with the CLI's provider/model/device overrides applied."""
+    overrides = {
+        "embedding_provider": args.provider,
+        "embedding_model": args.model,
+        "embedding_device": args.device,
+        "embedding_dimension": args.dimension,
+    }
+    settings = get_settings()
+    values = {k: v for k, v in overrides.items() if v is not None}
+    return settings.model_copy(update=values) if values else settings
+
+
 def cmd_index(args: argparse.Namespace) -> int:
-    provider = None if args.no_embed else get_embedding_provider(get_settings())
+    """Rebuild search documents and embeddings without re-importing the dataset."""
+    try:
+        settings = _index_settings(args)
+        provider = None if args.no_embed else get_embedding_provider(settings)
+    except AppError as exc:
+        _print({"error": exc.code, "message": exc.message})
+        return 1
 
     async def run(session):  # noqa: ANN001, ANN202
-        return await IngestionService(session, provider).reindex(
-            args.dataset_id, embed=not args.no_embed
+        dataset_id = args.dataset_id
+        if dataset_id is None:
+            if not (args.coding_system and args.version):
+                raise DatasetNotFound("Use --dataset-id or --coding-system with --version")
+            dataset = await DatasetResolver(session).resolve(
+                coding_system=args.coding_system, version=args.version
+            )
+            dataset_id = dataset.id
+        payload = await IngestionService(session, provider).reindex(
+            dataset_id,
+            embed=not args.no_embed,
+            force=args.force,
+            batch_size=args.batch_size,
         )
+        return {"dataset_id": dataset_id, **payload}
 
     try:
         payload = asyncio.run(_with_session(run))
     except AppError as exc:
-        _print({"error": exc.code, "message": exc.message})
+        _print({"error": exc.code, "message": exc.message, "details": exc.details})
         return 1
-    _print({"dataset_id": args.dataset_id, **payload})
+    _print(payload)
     return 0
 
 
@@ -204,8 +236,18 @@ def build_parser() -> argparse.ArgumentParser:
     source_args(ingest)
     ingest.add_argument("--embed", action="store_true", help="also generate embeddings")
     ingest.add_argument("--licence-basis", help="operator statement of the licence/rights")
-    index = sub.add_parser("index", help="rebuild search documents / embeddings")
-    index.add_argument("--dataset-id", type=int, required=True)
+    index = sub.add_parser("index", help="rebuild search documents / embeddings (no re-import)")
+    index.add_argument("--dataset-id", type=int)
+    index.add_argument("--coding-system", help="with --version: select the dataset by identity")
+    index.add_argument("--version")
+    index.add_argument("--provider", help="override EMBEDDING_PROVIDER")
+    index.add_argument("--model", help="override EMBEDDING_MODEL")
+    index.add_argument("--device", help="override EMBEDDING_DEVICE (cpu, cuda, mps)")
+    index.add_argument("--dimension", type=int, help="expected dimension (validated)")
+    index.add_argument("--batch-size", type=int, help="override EMBEDDING_BATCH_SIZE")
+    index.add_argument(
+        "--force", action="store_true", help="re-embed every document, even if unchanged"
+    )
     index.add_argument("--no-embed", action="store_true")
     sub.add_parser("datasets", help="list datasets")
     return parser

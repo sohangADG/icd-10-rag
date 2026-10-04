@@ -76,3 +76,87 @@ unsupported-code rate 0.00, rule-violation rate 0.00, retrieval recall@3 0.94.
 - Secret scan (regex for API keys, AWS keys, private keys, tokens, password literals) over all
   changed and new files. The only match is the placeholder `"sk-secret"` passed to an HTTP mock
   transport in a unit test.
+
+## 7. Semantic embeddings (2026-10-04)
+
+Real local model: `sentence_transformers` / `BAAI/bge-small-en-v1.5`, **384 dimensions read from
+the model**, CPU, normalised, cosine distance. The model is cached in the `hf-cache` Docker
+volume; the image has CPU-only torch 2.14.1, sentence-transformers 6.1.0, and is 2.22 GB.
+
+| Check | Result |
+|---|---|
+| Default suite (hashing, deterministic, offline) | **325 passed, 5 skipped** (the opt-in real-model tests); 330 tests = 215 unit + 115 integration. Stable over 3 consecutive runs. |
+| Real-model suite (`RUN_SEMANTIC_MODEL_TESTS=1 pytest -m semantic_model`) | **5 passed** |
+| Runtime E2E (`scripts/runtime_e2e.py`, configured provider = sentence_transformers) | **53/53**, on two consecutive fresh-database runs |
+| Migration | fresh DB at `0003`; dev DB upgraded 0002 → 0003 |
+
+E2E semantic flow: paraphrase source → ingest → READY → 17 logical documents → real embeddings
+(17 embedded, 0 failed, embed 447 ms, write 84 ms) → pgvector + HNSW (`vector_cosine_ops`,
+provider/model/dimension predicate) → HTTP `/search`: 13/14 paraphrase queries return the target
+first, with zero lexical overlap (e.g. "hypertension" → P00 *Elevated arterial pressure disorder*,
+semantic 0.38, raw cosine 0.75, lexical 0) → HTTP `/suggest` "Assessment: epilepsy. Denies hay
+fever." → **P07** *Recurrent seizure condition* (DB-verified; "hay fever" negated, not coded).
+A forced re-index regenerated 55 vectors in 4 batches; the normal re-index skipped all 55 as
+unchanged.
+
+### Provider comparison (`python -m app.evaluation.cli compare`), retrieval stage, k = 3
+
+Paraphrase suite (14 queries, no word shared with the target title):
+
+| Mode | Provider | Recall@3 | MRR | Top-1 |
+|---|---|---|---|---|
+| lexical only | – | 0.071 | 0.071 | 0.071 |
+| vector only | hashing | 0.143 | 0.186 | 0.071 |
+| hybrid | hashing | 0.143 | 0.193 | 0.071 |
+| vector only | sentence_transformers | **1.000** | **0.964** | **0.929** |
+| hybrid | sentence_transformers | **1.000** | **0.964** | **0.929** |
+
+Lexical-friendly synthetic suite (16 positive cases):
+
+| Mode | Provider | Recall@3 | MRR | Top-1 |
+|---|---|---|---|---|
+| lexical only | – | 0.938 | 0.877 | 0.812 |
+| vector only | hashing | 0.812 | 0.776 | 0.688 |
+| hybrid | hashing | 0.938 | 0.877 | 0.812 |
+| vector only | sentence_transformers | 0.938 | 0.919 | 0.875 |
+| hybrid | sentence_transformers | 0.938 | 0.887 | 0.812 |
+
+Full suggestion pipeline (reranking, rules, specificity, evidence gate, DB verification) with the
+real model:
+- **Synthetic suite:** final top-1 1.00, negative-case accuracy 1.00, unsupported-code rate 0.
+- **Paraphrase suite:** final top-1 0.786. The other 3 cases (anaemia, eczema, insomnia) are
+  **abstentions** with weak evidence; no wrong code was returned. Unsupported-code rate 0.
+
+### Timings (tiny synthetic data; architecture check only, not production figures)
+
+| Operation | sentence_transformers (CPU) | hashing |
+|---|---|---|
+| Embed 55 documents | 1.35 s (+0.13 s DB write) | 0.03 s (+0.14 s write) |
+| Embed 17 documents | 0.36 s (+0.10 s write) | 0.003 s (+0.06 s write) |
+| Vector-only query (embed query + pgvector) | mean 33–40 ms, p95 64–74 ms | mean 2.5 ms |
+| Hybrid query (all components) | mean 17–23 ms, p95 25–36 ms* | mean 18–20 ms |
+| Model load at startup (first run downloads ~130 MB) | ~36 s first time, then from cache | – |
+
+\*Hybrid ran after vector-only on the same queries, so it was served by the query-embedding
+cache. This shows the cache working; it is not a like-for-like latency comparison.
+
+### Pre-commit review (2026-10-04)
+
+- Fresh-database PostgreSQL checks:
+  - 127 vectors, all `sentence_transformers` / `BAAI/bge-small-en-v1.5` / 384 / normalised;
+  - 0 `vector_dims` mismatches;
+  - 0 vectors without a content hash;
+  - 0 un-embedded embeddable documents;
+  - 0 duplicate documents;
+  - 0 vector/record dataset mismatches;
+  - 0 cross-dataset node links or rule targets;
+  - one HNSW index (`vector_cosine_ops`, full space predicate), 3 pg_trgm indexes and the FTS GIN
+    index;
+  - Alembic at `0003` with both new CHECK constraints.
+- Migration 0003, tested in `tests/integration/test_migration_0003.py`:
+  - upgrading a populated 0002 database backfills provider and normalisation;
+  - the dimension and space constraints reject invalid rows;
+  - downgrade to 0002 keeps the data, and re-upgrade works.
+- Docker: `docker compose build` succeeds. The image has CPU-only torch `2.14.1+cpu` and
+  sentence-transformers 6.1.0. The model lives in the external `hf-cache` volume (129 MB), and
+  git tracks no model files.

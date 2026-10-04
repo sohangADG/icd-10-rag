@@ -63,6 +63,30 @@ offered as an alternative: the classification parent of an unsupported candidate
 admissible record exists, the resolver moves to the next accepted candidate. An unsupported
 candidate without a classification parent is never returned.
 
+## 3b. Minimum evidence gate (abstention)
+
+A candidate is suggested only if at least one retrieval signal reaches a minimum:
+
+| Signal | Default threshold | Setting |
+|---|---|---|
+| lexical (≈ half of the concept's words covered) | 0.40 | `SUGGESTION_MIN_LEXICAL_EVIDENCE` |
+| exact code, fuzzy, semantic, index term (calibrated above their noise floors) | 0.15 | `SUGGESTION_MIN_EVIDENCE` |
+
+Hierarchy context never counts as evidence on its own. A concept that matches one of the
+candidate's own inclusion terms passes regardless. Otherwise the concept is returned in
+`unmatched_concepts` with the reason "Insufficient retrieval evidence". The system abstains:
+it never falls back to whichever vector happens to be closest. Covered cases:
+- a near-tie between two records' semantic scores ("insomnia" with bge-small: cosine 0.648 vs
+  0.643);
+- one shared generic word ("purple quokka **syndrome**");
+- unknown terminology;
+- a one-word ambiguous symptom ("Pain.").
+
+**The thresholds are tunable defaults, not medical truths.** They were chosen on the synthetic
+suites to trade recall for precision: on the paraphrase suite, 3 of 14 concepts are abstained on
+and none are wrongly coded. Re-tune them with the evaluation tooling against coder-labelled
+cases for each real dataset and embedding model.
+
 ## 4. Final database verification (hallucination prevention)
 
 ```

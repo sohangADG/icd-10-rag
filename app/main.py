@@ -1,3 +1,4 @@
+import asyncio
 import logging
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
@@ -6,6 +7,7 @@ from fastapi import FastAPI
 from sqlalchemy import text
 from sqlalchemy.exc import SQLAlchemyError
 
+from app.api.deps import load_provider
 from app.api.errors import register_exception_handlers
 from app.api.health import router as health_router
 from app.api.middleware import RequestContextMiddleware
@@ -38,6 +40,10 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     settings = get_settings()
     logger.info("starting service", extra={"service": settings.app_name, "env": settings.app_env})
     await verify_database()
+    if settings.embedding_provider != "none":
+        # Load the embedding model once at startup (first run downloads it into HF_HOME), so
+        # the first request does not pay for it. Failures are logged and handled per request.
+        await asyncio.to_thread(load_provider, settings)
     yield
     await dispose_engine()
     logger.info("service stopped")

@@ -8,6 +8,7 @@ from app.clinical.models import AssertionStatus, ClinicalConcept, ConceptType
 from app.coding.specificity import check_specificity
 from app.core.config import Settings
 from app.core.exceptions import RetrievalError
+from app.indexing.vector_space import VectorSpace
 from app.repositories.search_repository import SearchRepository
 
 EXTRACTOR = RuleBasedConceptExtractor()
@@ -175,4 +176,4 @@ def test_retrieval_weights_cannot_all_be_zero() -> None:
 async def test_query_vector_dimension_is_validated() -> None:
     repository = SearchRepository(session=None)  # type: ignore[arg-type]
     with pytest.raises(RetrievalError, match="dimensions"):
-        await repository.semantic(1, "m", 4, [0.1, 0.2], limit=5)
+        await repository.semantic(1, VectorSpace("hashing", "m", 4, True), [0.1, 0.2], limit=5)

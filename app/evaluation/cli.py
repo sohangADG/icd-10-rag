@@ -19,9 +19,12 @@ from app.core.config import get_settings
 from app.core.database import create_engine_from_settings
 from app.core.logging import configure_logging
 from app.evaluation.models import EvalCase, load_cases
+from app.evaluation.retrieval_comparison import compare_providers
 from app.evaluation.runner import EvaluationRunner
 from app.indexing.embeddings import get_embedding_provider
+from app.services.dataset_resolver import DatasetResolver
 from app.synthetic.eval_cases import synthetic_cases
+from app.synthetic.paraphrase import paraphrase_cases
 
 
 async def evaluate(cases: list[EvalCase], k: int) -> dict[str, Any]:
@@ -35,6 +38,35 @@ async def evaluate(cases: list[EvalCase], k: int) -> dict[str, Any]:
         await engine.dispose()
 
 
+async def compare(
+    coding_system: str, version: str, cases: list[EvalCase], providers: list[str], k: int
+) -> dict[str, Any]:
+    settings = get_settings()
+    built = [
+        get_embedding_provider(settings.model_copy(update={"embedding_provider": name}))
+        for name in providers
+    ]
+    engine = create_engine_from_settings(settings)
+    try:
+        async with async_sessionmaker(engine, expire_on_commit=False)() as session:
+            dataset = await DatasetResolver(session).resolve(
+                coding_system=coding_system, version=version
+            )
+            return await compare_providers(
+                session, settings, dataset, cases, [p for p in built if p is not None], k=k
+            )
+    finally:
+        await engine.dispose()
+
+
+def _cases(name: str) -> list[EvalCase]:
+    if name == "paraphrase":
+        return [EvalCase.model_validate(c) for c in paraphrase_cases()]
+    if name == "synthetic":
+        return [EvalCase.model_validate(c) for c in synthetic_cases() if c.get("expected_code")]
+    return load_cases(Path(name))
+
+
 def main(argv: list[str] | None = None) -> int:
     settings = get_settings()
     configure_logging("WARNING", settings.log_format, stream=sys.stderr)
@@ -44,16 +76,48 @@ def main(argv: list[str] | None = None) -> int:
     source = run.add_mutually_exclusive_group(required=True)
     source.add_argument("--cases", help="JSONL or CSV evaluation cases")
     source.add_argument("--synthetic", action="store_true", help="built-in synthetic cases")
+    source.add_argument(
+        "--paraphrase", action="store_true", help="built-in paraphrase (semantic) cases"
+    )
     run.add_argument("--k", type=int, default=3)
     run.add_argument("--out", help="write the full JSON report here")
     run.add_argument("--summary", action="store_true", help="omit per-case details on stdout")
+    cmp = sub.add_parser(
+        "compare",
+        help="compare lexical-only / vector-only / hybrid retrieval per embedding provider "
+        "(re-embeds the dataset for each provider; the last one stays active)",
+    )
+    cmp.add_argument("--coding-system", required=True)
+    cmp.add_argument("--version", required=True)
+    cmp.add_argument("--cases", default="paraphrase", help="paraphrase | synthetic | FILE")
+    cmp.add_argument("--providers", default="hashing,sentence_transformers")
+    cmp.add_argument("--k", type=int, default=3)
+    cmp.add_argument("--out")
+    cmp.add_argument("--summary", action="store_true")
     args = parser.parse_args(argv)
 
-    cases = (
-        [EvalCase.model_validate(c) for c in synthetic_cases()]
-        if args.synthetic
-        else load_cases(Path(args.cases))
-    )
+    if args.command == "compare":
+        report = asyncio.run(
+            compare(
+                args.coding_system,
+                args.version,
+                _cases(args.cases),
+                [p.strip() for p in args.providers.split(",") if p.strip()],
+                args.k,
+            )
+        )
+        if args.out:
+            Path(args.out).write_text(json.dumps(report, indent=2, default=str), encoding="utf-8")
+        shown = {k: v for k, v in report.items() if not (args.summary and k == "details")}
+        print(json.dumps(shown, indent=2, default=str))
+        return 0
+
+    if args.synthetic:
+        cases = [EvalCase.model_validate(c) for c in synthetic_cases()]
+    elif args.paraphrase:
+        cases = _cases("paraphrase")
+    else:
+        cases = load_cases(Path(args.cases))
     report = asyncio.run(evaluate(cases, args.k))
     if args.out:
         Path(args.out).write_text(json.dumps(report, indent=2, default=str), encoding="utf-8")

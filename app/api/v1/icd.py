@@ -9,13 +9,12 @@ from typing import Annotated, Literal
 from fastapi import APIRouter, Depends, Query
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.api.deps import embedding_provider, rate_limit_hook
+from app.api.deps import ProviderHandle, embedding_provider, rate_limit_hook
 from app.coding.suggestion_service import SuggestionService
 from app.core.config import Settings, get_settings
 from app.core.constants import DatasetStatus, NodeType
 from app.core.database import get_session
 from app.core.exceptions import DatasetNotFound, InvalidICDCodeError
-from app.indexing.embeddings import EmbeddingProvider
 from app.models import IcdDataset, IcdNode
 from app.repositories.dataset_repository import DatasetRepository
 from app.repositories.icd_repository import IcdRepository
@@ -39,7 +38,7 @@ router = APIRouter(prefix="/api/v1/icd", tags=["icd"], dependencies=[Depends(rat
 
 SessionDep = Annotated[AsyncSession, Depends(get_session)]
 SettingsDep = Annotated[Settings, Depends(get_settings)]
-ProviderDep = Annotated[EmbeddingProvider | None, Depends(embedding_provider)]
+ProviderDep = Annotated[ProviderHandle, Depends(embedding_provider)]
 
 
 class DatasetSelector:
@@ -165,9 +164,14 @@ async def search(
             query=q,
             mode=mode,
             semantic_available=False,
+            semantic_status="not_used",
             results=results,
         )
-    retriever = HybridRetriever(session, settings, provider if mode == "hybrid" else None)
+    retriever = (
+        HybridRetriever(session, settings, provider.provider, provider_status=provider.status)
+        if mode == "hybrid"
+        else HybridRetriever(session, settings, None)
+    )
     result = await retriever.retrieve(
         dataset,
         [q],
@@ -181,6 +185,8 @@ async def search(
         query=q,
         mode=mode,
         semantic_available=result.semantic_available,
+        semantic_status=result.semantic_status.value if mode == "hybrid" else "not_used",
+        embedding_space=result.embedding_space,
         results=[
             SearchHit(
                 record_id=c.node.id,
@@ -189,7 +195,7 @@ async def search(
                 level=c.node.node_type.value,
                 is_selectable=c.node.is_selectable,
                 hybrid_score=c.hybrid_score,
-                scores=c.scores.as_dict(),
+                scores={**c.scores.as_dict(), "semantic_raw": c.scores.semantic_raw},
                 matched_terms=[
                     MatchedTerm(
                         text=m.matched_text, match_type=m.match_type, score=round(m.score, 4)
@@ -274,4 +280,6 @@ async def suggest(
 ) -> SuggestResponse:
     """Evidence-backed suggestions. The clinical note is processed in memory only: it is not
     stored and not logged."""
-    return await SuggestionService(session, settings, provider).suggest(request)
+    return await SuggestionService(
+        session, settings, provider.provider, provider_status=provider.status
+    ).suggest(request)

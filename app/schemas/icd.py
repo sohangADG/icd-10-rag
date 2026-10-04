@@ -117,6 +117,11 @@ class SearchResponse(BaseModel):
     query: str
     mode: Literal["exact", "text", "hybrid"]
     semantic_available: bool
+    # ok | disabled | provider_unavailable | not_indexed | incomplete_index | error |
+    # not_used (exact/text modes)
+    semantic_status: str
+    # Provider/model/dimension/distance of the semantic component (never vectors).
+    embedding_space: dict[str, Any] | None = None
     results: list[SearchHit]
 
 

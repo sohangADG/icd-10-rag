@@ -18,7 +18,6 @@ from app.indexing.embeddings import (
     OpenAIEmbeddingProvider,
     get_embedding_provider,
 )
-from app.indexing.indexer import embedding_text
 
 # --- embeddings ----------------------------------------------------------------------------------
 
@@ -98,11 +97,6 @@ def test_provider_factory_reads_configuration() -> None:
     assert remote is not None and remote.remote
 
 
-def test_embedding_text_excludes_exclusions() -> None:
-    content = "A00 Airway infection\nIncludes: x\nExcludes: newborn infection (B15)\nDataset: d"
-    assert "newborn" not in embedding_text(content) and "Includes: x" in embedding_text(content)
-
-
 # --- evaluation metrics ---------------------------------------------------------------------------
 
 
@@ -155,7 +149,9 @@ def client(monkeypatch: pytest.MonkeyPatch) -> Iterator[TestClient]:
 def test_invalid_suggest_requests_are_rejected_without_echoing_the_note(client: TestClient) -> None:
     secret_note = "Patient John Doe, MRN 12345, has acute airway infection"
     cases = [
+        {"clinical_note": "", "coding_system": "SYNTH-ICD", "version": "2024"},
         {"clinical_note": "   ", "coding_system": "SYNTH-ICD", "version": "2024"},
+        {"clinical_note": "\n\t ", "coding_system": "SYNTH-ICD", "version": "2024"},
         {"clinical_note": secret_note, "coding_system": "SYNTH-ICD"},
         {"clinical_note": secret_note, "coding_system": "S", "version": "1", "top_k": 0},
         {"clinical_note": secret_note, "coding_system": "S", "version": "1", "extra": 1},
