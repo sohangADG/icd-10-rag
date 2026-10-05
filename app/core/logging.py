@@ -1,11 +1,25 @@
 import json
 import logging
 import sys
+from contextvars import ContextVar
 from datetime import UTC, datetime
-from typing import Any
+from typing import Any, TextIO
 
 # Attributes present on every LogRecord; anything else came from `extra=` and becomes a field.
 _STANDARD_ATTRS = frozenset(vars(logging.makeLogRecord({})).keys()) | {"message", "asctime"}
+
+# Correlation id of the HTTP request being served (set by RequestContextMiddleware).
+request_id_var: ContextVar[str | None] = ContextVar("request_id", default=None)
+
+
+class RequestIdFilter(logging.Filter):
+    """Adds `request_id` to every record emitted while a request is being handled."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        request_id = request_id_var.get()
+        if request_id is not None and not hasattr(record, "request_id"):
+            record.request_id = request_id
+        return True
 
 
 class JsonFormatter(logging.Formatter):
@@ -34,9 +48,10 @@ class ConsoleFormatter(logging.Formatter):
         return f"{line} {extras}" if extras else line
 
 
-def configure_logging(level: str, fmt: str) -> None:
-    handler = logging.StreamHandler(sys.stdout)
+def configure_logging(level: str, fmt: str, stream: TextIO | None = None) -> None:
+    handler = logging.StreamHandler(stream or sys.stdout)
     handler.setFormatter(JsonFormatter() if fmt == "json" else ConsoleFormatter())
+    handler.addFilter(RequestIdFilter())
     root = logging.getLogger()
     root.handlers[:] = [handler]
     root.setLevel(level)
@@ -45,3 +60,6 @@ def configure_logging(level: str, fmt: str) -> None:
         uvicorn_logger = logging.getLogger(name)
         uvicorn_logger.handlers.clear()
         uvicorn_logger.propagate = True
+    # Access logs include full URLs (query strings may carry search text): our own latency
+    # middleware logs method/route/status instead.
+    logging.getLogger("uvicorn.access").setLevel(logging.WARNING)

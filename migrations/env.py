@@ -8,6 +8,7 @@ from sqlalchemy.ext.asyncio import create_async_engine
 
 from app.core.config import get_settings
 from app.models import Base
+from app.models.search_document import HNSW_INDEX_PREFIX
 
 config = context.config
 
@@ -15,6 +16,14 @@ if config.config_file_name is not None and config.attributes.get("configure_logg
     fileConfig(config.config_file_name)
 
 target_metadata = Base.metadata
+
+
+def include_object(
+    obj: object, name: str | None, type_: str, reflected: bool, compare_to: object
+) -> bool:
+    """Per-embedding-model HNSW indexes are created at runtime by the indexer (their dimension
+    depends on configuration), so autogenerate must neither drop nor recreate them."""
+    return not (type_ == "index" and name is not None and name.startswith(HNSW_INDEX_PREFIX))
 
 
 def _database_url() -> URL:
@@ -29,6 +38,7 @@ def run_migrations_offline() -> None:
     context.configure(
         dialect_name="postgresql",
         target_metadata=target_metadata,
+        include_object=include_object,
         literal_binds=True,
         dialect_opts={"paramstyle": "named"},
         compare_type=True,
@@ -38,7 +48,12 @@ def run_migrations_offline() -> None:
 
 
 def _run_sync_migrations(connection: Connection) -> None:
-    context.configure(connection=connection, target_metadata=target_metadata, compare_type=True)
+    context.configure(
+        connection=connection,
+        target_metadata=target_metadata,
+        include_object=include_object,
+        compare_type=True,
+    )
     with context.begin_transaction():
         context.run_migrations()
 

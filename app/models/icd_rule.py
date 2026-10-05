@@ -1,3 +1,5 @@
+from typing import Any
+
 from sqlalchemy import (
     BigInteger,
     Boolean,
@@ -8,6 +10,7 @@ from sqlalchemy import (
     Text,
     UniqueConstraint,
 )
+from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.core.constants import RuleType
@@ -15,11 +18,12 @@ from app.models.base import Base, CreatedAtMixin, IdMixin, same_dataset_fk, str_
 
 
 class IcdRule(IdMixin, CreatedAtMixin, Base):
-    """A structured coding instruction (includes/excludes/notes/dagger-asterisk...).
+    """A structured coding instruction (includes/excludes/notes/code first/see...).
 
     node_id is nullable and may point at any hierarchy level (chapter, block, category...),
     since instructions are not restricted to final codes. target_code preserves the code
-    exactly as printed even when it cannot (yet) be resolved to target_node_id.
+    exactly as printed, and is only set when the source states exactly one code; ambiguous
+    references keep target_code NULL and list what was seen in metadata["referenced_codes"].
     """
 
     __tablename__ = "icd_rules"
@@ -38,8 +42,14 @@ class IcdRule(IdMixin, CreatedAtMixin, Base):
         str_enum(RuleType, "rule_type"), nullable=False, index=True
     )
     rule_text: Mapped[str] = mapped_column(Text, nullable=False)
+    # Only for EXCLUDE rules, and only when the source distinguishes kinds (e.g. Excludes1/2).
+    exclusion_type: Mapped[str | None] = mapped_column(String(32))
     target_code: Mapped[str | None] = mapped_column(String(32), index=True)
     target_node_id: Mapped[int | None] = mapped_column(BigInteger, index=True)
     is_mandatory: Mapped[bool | None] = mapped_column(Boolean)
     scope: Mapped[str | None] = mapped_column(String(64))
-    source_page: Mapped[int] = mapped_column(Integer, nullable=False)
+    source_page: Mapped[int | None] = mapped_column(Integer)
+    source_locator: Mapped[dict[str, Any] | None] = mapped_column(JSONB)
+    metadata_: Mapped[dict[str, Any]] = mapped_column(
+        "metadata", JSONB, nullable=False, default=dict, server_default="{}"
+    )

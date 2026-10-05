@@ -26,3 +26,11 @@ data/sources/*
 .vscode/
 .DS_Store
 Thumbs.db
+
+# Regenerable synthetic fixtures (python -m app.synthetic.cli build)
+data/synthetic/
+
+# Local model caches (Hugging Face / sentence-transformers); models are downloaded, never committed
+/.cache/
+/hf-cache/
+/models/

@@ -8,8 +8,18 @@ from enum import StrEnum
 
 
 class DatasetStatus(StrEnum):
+    """Dataset lifecycle. Only READY datasets are served by retrieval/suggestion APIs.
+
+    PENDING -> PROCESSING -> INDEXING -> READY
+                  |-> VALIDATION_FAILED   (fatal validation errors; no content persisted)
+                  |-> FAILED              (unexpected failure; transaction rolled back)
+    READY -> ARCHIVED                     (kept for history, no longer served)
+    """
+
     PENDING = "pending"
-    INGESTING = "ingesting"
+    PROCESSING = "processing"
+    VALIDATION_FAILED = "validation_failed"
+    INDEXING = "indexing"
     READY = "ready"
     FAILED = "failed"
     ARCHIVED = "archived"
@@ -30,6 +40,18 @@ CLASSIFICATION_NODE_TYPES: tuple[NodeType, ...] = (
     NodeType.CODE,
 )
 
+# Grouping levels: they organise codes but are never themselves assigned to an encounter.
+GROUPING_NODE_TYPES: tuple[NodeType, ...] = (NodeType.CHAPTER, NodeType.BLOCK)
+
+# Canonical top-down order, used for depth sanity checks (a child is never "above" its parent).
+NODE_TYPE_RANK: dict[NodeType, int] = {
+    NodeType.CHAPTER: 0,
+    NodeType.BLOCK: 1,
+    NodeType.CATEGORY: 2,
+    NodeType.SUBCATEGORY: 3,
+    NodeType.CODE: 4,
+}
+
 
 class NodeStatus(StrEnum):
     ACTIVE = "active"
@@ -46,15 +68,56 @@ class TermType(StrEnum):
 
 
 class RuleType(StrEnum):
+    """Persisted coding-instruction type (icd_rules.rule_type).
+
+    INCLUDE/EXCLUDE are the Phase 1 spellings of the INCLUDES/EXCLUDES instruction types; see
+    InstructionType for the source-independent vocabulary and the mapping between them.
+    """
+
     INCLUDE = "INCLUDE"
     EXCLUDE = "EXCLUDE"
     NOTE = "NOTE"
     USE_ADDITIONAL_CODE = "USE_ADDITIONAL_CODE"
     CODE_SEPARATELY = "CODE_SEPARATELY"
+    CODE_ALSO = "CODE_ALSO"
+    CODE_FIRST = "CODE_FIRST"
     DAGGER = "DAGGER"
     ASTERISK = "ASTERISK"
     CROSS_REFERENCE = "CROSS_REFERENCE"
+    SEE = "SEE"
+    SEE_ALSO = "SEE_ALSO"
     INSTRUCTION = "INSTRUCTION"
+    OTHER = "OTHER"
+
+
+class InstructionType(StrEnum):
+    """Source-independent coding instruction vocabulary used by adapters and the API."""
+
+    INCLUDES = "INCLUDES"
+    EXCLUDES = "EXCLUDES"
+    NOTE = "NOTE"
+    CODE_ALSO = "CODE_ALSO"
+    USE_ADDITIONAL_CODE = "USE_ADDITIONAL_CODE"
+    CODE_FIRST = "CODE_FIRST"
+    SEE = "SEE"
+    SEE_ALSO = "SEE_ALSO"
+    OTHER = "OTHER"
+
+
+INSTRUCTION_TO_RULE: dict[InstructionType, RuleType] = {
+    InstructionType.INCLUDES: RuleType.INCLUDE,
+    InstructionType.EXCLUDES: RuleType.EXCLUDE,
+    InstructionType.NOTE: RuleType.NOTE,
+    InstructionType.CODE_ALSO: RuleType.CODE_ALSO,
+    InstructionType.USE_ADDITIONAL_CODE: RuleType.USE_ADDITIONAL_CODE,
+    InstructionType.CODE_FIRST: RuleType.CODE_FIRST,
+    InstructionType.SEE: RuleType.SEE,
+    InstructionType.SEE_ALSO: RuleType.SEE_ALSO,
+    InstructionType.OTHER: RuleType.OTHER,
+}
+RULE_TO_INSTRUCTION: dict[RuleType, InstructionType] = {
+    rule: instruction for instruction, rule in INSTRUCTION_TO_RULE.items()
+}
 
 
 class RelationshipType(StrEnum):
@@ -81,7 +144,23 @@ class IngestionRunStatus(StrEnum):
     COMPLETED = "completed"
     FAILED = "failed"
     PARTIALLY_COMPLETED = "partially_completed"
+    VALIDATION_FAILED = "validation_failed"
+    SKIPPED = "skipped"
 
+
+class SourceType(StrEnum):
+    PDF = "pdf"
+    PDF_OCR = "pdf_ocr"
+    TEXT = "text"
+    CSV = "csv"
+    TSV = "tsv"
+    JSON = "json"
+    XML = "xml"
+    XLSX = "xlsx"
+
+
+# Search document type for the one-retrieval-unit-per-ICD-entity representation.
+SEARCH_DOCUMENT_TYPE_RECORD = "icd_record"
 
 # Identity of the first target dataset. Only metadata — no classification content.
 ICD10CA_2022 = {

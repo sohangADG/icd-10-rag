@@ -1,7 +1,7 @@
 [project]
 name = "icd-rag-service"
 version = "0.1.0"
-description = "Standalone, version-aware ICD coding RAG service (Phase 1: foundation)."
+description = "Standalone, version-aware, evidence-backed ICD coding RAG service."
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
@@ -13,14 +13,29 @@ dependencies = [
     "asyncpg>=0.30",
     "alembic>=1.14",
     "pgvector>=0.3.6",
+    # Ingestion: text-based PDF extraction (pdfminer.six underneath), XLSX, hardened XML parsing.
+    "pdfplumber>=0.11",
+    "openpyxl>=3.1",
+    "defusedxml>=0.7",
+    # HTTP client for remote (OpenAI-compatible) embedding providers.
+    "httpx>=0.27",
+    # Default local semantic embeddings. Install a CPU-only torch first to avoid CUDA wheels:
+    #   pip install torch --index-url https://download.pytorch.org/whl/cpu
+    "sentence-transformers>=3.0",
 ]
 
 [project.optional-dependencies]
 dev = [
     "pytest>=8.3",
     "pytest-asyncio>=0.24",
-    "httpx>=0.27",
     "ruff>=0.8",
+    # Generates synthetic PDF fixtures (including permission-restricted ones) in tests.
+    "reportlab>=4.2",
+]
+# Optional OCR path for scanned PDFs. Never used unless explicitly selected.
+ocr = [
+    "pytesseract>=0.3.10",
+    "pypdfium2>=4.30",
 ]
 
 [build-system]
@@ -37,6 +52,7 @@ pythonpath = ["."]
 testpaths = ["tests"]
 markers = [
     "integration: requires a running PostgreSQL + pgvector database",
+    "semantic_model: loads a real sentence-transformers model (downloads it on first use)",
 ]
 
 [tool.ruff]
