@@ -86,6 +86,9 @@ class EmbeddingProvider(ABC):
     default_similarity_floor: ClassVar[float] = 0.0
     #: True when text leaves this process (network call to a third party).
     remote: ClassVar[bool] = False
+    #: True when similarity reflects meaning (a language model). A purely lexical provider is
+    #: never accepted as the only evidence that a concept and a code name the same condition.
+    meaning_based: ClassVar[bool] = True
 
     model: str
     dimension: int
@@ -163,6 +166,7 @@ class HashingEmbeddingProvider(EmbeddingProvider):
     """Deterministic lexical hashing. For tests and offline development only."""
 
     provider_name: ClassVar[str] = "hashing"
+    meaning_based: ClassVar[bool] = False
 
     def __init__(
         self, dimension: int = 256, model: str = "hashing-v1", *, normalize: bool = True

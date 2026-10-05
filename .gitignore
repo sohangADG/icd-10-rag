@@ -29,6 +29,7 @@ Thumbs.db
 
 # Regenerable synthetic fixtures (python -m app.synthetic.cli build)
 data/synthetic/
+/data/evaluation/
 
 # Local model caches (Hugging Face / sentence-transformers); models are downloaded, never committed
 /.cache/

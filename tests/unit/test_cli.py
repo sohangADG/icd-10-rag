@@ -30,7 +30,7 @@ def test_validate_dry_run(sources: Path, capsys: pytest.CaptureFixture[str]) -> 
     assert (stats["dataset"], stats["version"], stats["records_extracted"]) == (
         "SYNTH-ICD",
         "2024",
-        55,
+        70,
     )
     assert stats["validation_errors"] == 0 and stats["pages_processed"] >= 5
 

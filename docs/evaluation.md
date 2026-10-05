@@ -1,5 +1,9 @@
 # Evaluation
 
+> For the Phase 3 clinical scenario suite (266 scenarios, stage-separated metrics, failure
+> taxonomy and release safety gates), see
+> [clinical-safety-evaluation.md](clinical-safety-evaluation.md).
+
 ```bash
 python -m app.evaluation.cli run --synthetic --summary
 python -m app.evaluation.cli run --cases my_cases.jsonl --k 3 --out report.json

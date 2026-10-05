@@ -480,7 +480,7 @@ def run_db_checks(database: str) -> None:
     )
     check(
         "records persisted per dataset",
-        dict(counts) == {"2024": 55, "2025": 55, "paraphrase-1": 17, "malformed": 0},
+        dict(counts) == {"2024": 70, "2025": 70, "paraphrase-1": 17, "malformed": 0},
         counts,
     )
     duplicates = q(
@@ -512,7 +512,7 @@ def run_db_checks(database: str) -> None:
         "embeddings stored with provider + model + real dimension",
         len(embeddings) == 1
         and embeddings[0][:3] == expected
-        and embeddings[0][3] == 55 + 55 + 17
+        and embeddings[0][3] == 70 + 70 + 17
         and embeddings[0][4] is True
         and embeddings[0][5] is True,
         embeddings,

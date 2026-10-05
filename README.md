@@ -46,6 +46,7 @@ clinical notes. Suggestions are decision support, and a qualified coder makes th
 | Rules, specificity, hallucination guard | [docs/coding-validation.md](docs/coding-validation.md) |
 | HTTP API | [docs/api.md](docs/api.md) |
 | Evaluation framework | [docs/evaluation.md](docs/evaluation.md) |
+| Clinical scenario & safety evaluation (Phase 3) | [docs/clinical-safety-evaluation.md](docs/clinical-safety-evaluation.md) |
 | Security | [docs/security.md](docs/security.md) |
 | Licensing (read before ingesting real data) | [docs/licensing.md](docs/licensing.md) |
 | Verified runtime results | [docs/runtime-verification.md](docs/runtime-verification.md) |
@@ -271,6 +272,22 @@ python -m app.evaluation.cli run --cases cases.jsonl --out report.json
 Metrics are reported separately for concept extraction, retrieval, reranking and final selection
 ([docs/evaluation.md](docs/evaluation.md)). Synthetic results validate **system behaviour only**.
 
+The clinical scenario suite has 266 original synthetic scenarios, 61 of which expect
+abstention. It reports stage-separated metrics, a failure taxonomy and **hard safety gates**:
+unsupported codes, cross-version and coding-system contamination, non-READY leakage, rule
+violations, unsupported specificity, and negated or (family-)history mentions coded as active,
+all of which must be 0.
+
+```bash
+docker compose run --rm app python -m scripts.clinical_evaluation_e2e   # fresh DB + HTTP
+python -m app.evaluation.cli run --dataset tests/evaluation/clinical_scenarios.json \
+    --coding-system SYNTH-ICD --version 2024 --output report.json --markdown report.md \
+    --fail-on-safety-error
+```
+
+See [docs/clinical-safety-evaluation.md](docs/clinical-safety-evaluation.md). No real ICD-10-CA
+accuracy is claimed.
+
 ## 14. Configuration
 
 All settings are environment variables (see `.env.example`). Beyond the database settings (§5):
@@ -321,6 +338,14 @@ test suite uses the deterministic `hashing` provider; the real-model tests run w
 - **The rule engine** matches exclusions by word overlap (≥ 75%). It does not apply
   dagger/asterisk pairing, sequencing logic or national coding standards (e.g. CIHI Canadian
   Coding Standards are not ingested).
+- **One code per clause.** "T2DM with CKD stage 3" is one concept and gives one code; the
+  linked condition must be documented in its own clause to be coded too.
+- **Words that type a concept.** A concept containing a symptom word is typed as a symptom
+  ("hay fever"), and a symptom is never coded on meaning-only evidence. A source synonym or
+  index term is then needed to code it.
+- **Weak spots of the small model.** Some paraphrases stay below the evidence gate (anaemia,
+  eczema), and short transposition typos ("athsma") are not retrieved. Administrative sentences
+  outside an `Admin:` section are extracted as (uncoded) concepts.
 - **ClaML `ModifierClass` expansion** is not supported.
 - **No Redis cache or rate limiter** is included. Hooks are in place (`rate_limit_hook`).
 - **The `icd_index_entries` hierarchy** (lead term → modifiers) is stored flat for source index

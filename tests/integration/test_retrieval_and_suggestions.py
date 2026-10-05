@@ -195,7 +195,7 @@ async def test_embeddings_are_not_regenerated_for_unchanged_content(
 ) -> None:
     indexer = SearchIndexer(session, get_embedding_provider(get_settings()))
     stats = await indexer.embed_documents(dataset)
-    assert stats.embedded == 0 and stats.skipped_unchanged == 55
+    assert stats.embedded == 0 and stats.skipped_unchanged == 70
 
 
 async def test_remote_embedding_requires_licence_permission(

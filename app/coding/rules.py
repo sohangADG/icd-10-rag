@@ -17,7 +17,7 @@ Matching is token-based and conservative; anything ambiguous is reported, not de
 from dataclasses import dataclass, field
 from typing import Any
 
-from app.clinical.models import ClinicalConcept
+from app.clinical.models import AssertionStatus, ClinicalConcept
 from app.coding.specificity import stems
 from app.core.constants import CLASSIFICATION_NODE_TYPES, RULE_TO_INSTRUCTION, RuleType, TermType
 from app.core.text import normalize_text
@@ -94,9 +94,20 @@ def matches_text(concept: ClinicalConcept, text: str, threshold: float) -> bool:
     return len(target & concept_words) / len(target) >= threshold
 
 
+_STATUS_PHRASES = {
+    AssertionStatus.FAMILY_HISTORY: ("family history of",),
+    AssertionStatus.HISTORY: ("personal history of", "history of"),
+}
+
+
 def inclusion_matches(concept: ClinicalConcept, term: str) -> bool:
+    """The concept (or an abbreviation expansion) states the inclusion term. History and
+    family-history concepts are compared in their full form ("family history of diabetes"),
+    as the status cue is stripped from the concept text."""
     normalized = normalize_text(term)
-    variants = [normalize_text(concept.text), *(normalize_text(v) for v in concept.expansions)]
+    plain = [concept.text, *concept.expansions]
+    phrased = [f"{p} {v}" for p in _STATUS_PHRASES.get(concept.status, ()) for v in plain]
+    variants = [normalize_text(v) for v in plain + phrased]
     if normalized in variants:
         return True
     term_stems = _content_stems(term)

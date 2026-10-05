@@ -55,16 +55,16 @@ async def test_import_persists_a_ready_dataset(session: AsyncSession, tmp_path: 
     assert dataset.source_checksum and len(dataset.source_checksum) == 64
     assert dataset.imported_at is not None and dataset.metadata_["licence"]["basis"] == "synthetic"
     assert outcome.counts == {
-        "nodes": 55,
-        "terms": 26,
-        "rules": 16,
+        "nodes": 70,
+        "terms": 29,
+        "rules": 17,
         "index_entries": 2,
-        "source_refs": 55,
+        "source_refs": 70,
         "rule_targets_resolved": 13,
         "index_targets_resolved": 0,
-        "search_documents": 55,
+        "search_documents": 70,
     }
-    assert await _count(session, IcdNode, dataset.id) == 55
+    assert await _count(session, IcdNode, dataset.id) == 70
 
 
 async def test_hierarchy_links_and_shortcuts(session: AsyncSession, tmp_path: Path) -> None:
@@ -142,7 +142,7 @@ async def test_duplicate_import_is_idempotent(session: AsyncSession, tmp_path: P
     second = await DatasetImporter(session).import_result(run_pipeline(path, manifest))
 
     assert second.status == "skipped" and second.dataset_id == first.dataset_id
-    assert await _count(session, IcdNode, first.dataset_id) == 55
+    assert await _count(session, IcdNode, first.dataset_id) == 70
     statuses = (
         (
             await session.execute(
@@ -234,7 +234,7 @@ async def test_failure_rolls_back_and_retry_succeeds(
     assert retry.status == "imported" and retry.dataset_id == dataset.id
     await session.refresh(dataset)
     assert dataset.status == DatasetStatus.READY
-    assert await _count(session, IcdNode, dataset.id) == 55
+    assert await _count(session, IcdNode, dataset.id) == 70
 
 
 async def test_versions_are_isolated(session: AsyncSession, tmp_path: Path) -> None:

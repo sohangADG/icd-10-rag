@@ -12,6 +12,7 @@ import json
 import sys
 from pathlib import Path
 
+from app.synthetic.alt_system import ALT_CHAPTERS, DATASET_ALT
 from app.synthetic.dataset import (
     CHAPTERS_2024,
     DATASET_2024,
@@ -42,6 +43,12 @@ def build(out: Path) -> list[str]:
     manifest = write_json(paraphrase, DATASET_PARAPHRASE, paraphrase_chapters())
     (out / (paraphrase.name + ".manifest.json")).write_text(json.dumps(manifest, indent=2))
     written += [paraphrase.name, paraphrase.name + ".manifest.json"]
+
+    # Second coding system with overlapping code strings (coding-system isolation tests).
+    alt = out / "synth_alt_2024_json.json"
+    manifest = write_json(alt, DATASET_ALT, ALT_CHAPTERS)
+    (out / (alt.name + ".manifest.json")).write_text(json.dumps(manifest, indent=2))
+    written += [alt.name, alt.name + ".manifest.json"]
 
     restricted = out / "synth_restricted_2024.pdf"
     manifest = write_pdf(restricted, DATASET_2024, CHAPTERS_2024, restricted=True)

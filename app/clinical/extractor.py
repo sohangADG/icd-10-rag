@@ -31,8 +31,15 @@ _SECTION_RE = re.compile(
 )
 # Clauses starting with these qualify the previous clause instead of naming a new concept.
 _QUALIFIER_START = re.compile(
-    r"^(?:with|without|complicated by|due to|secondary to|caused by|stage|type)\b", re.I
+    r"^(?:with|without|complicated by|due to|secondary to|caused by|stage|type|"
+    r"(?:initial|subsequent)\s+(?:encounter|visit)|sequelae?|uncomplicated|"
+    r"no\s+complications?)\b",
+    re.I,
 )
+_OR_SEPARATOR = re.compile(r"\bor\b", re.I)
+_EX_PREFIX = re.compile(r"^ex[\s-]+", re.I)
+_SITE_WORDS = frozenset(lx.ANATOMY)
+_SIDE_OR_SITE = frozenset(lx.ANATOMY) | frozenset(lx.LATERALITY)
 _TEMPORAL = re.compile(
     r"\b(?:today|yesterday|recently|currently|last (?:week|month|year)|this (?:week|month|year)|"
     r"(?:in|since) (?:19|20)\d{2}|(?:\d+|a|one|two|three|several) "
@@ -115,8 +122,9 @@ def extract_attributes(text: str) -> ClinicalAttributes:
     for index, word in enumerate(words):
         if word in ("bilateral", "bilaterally"):
             laterality.add("bilateral")
-        elif word in lx.LATERALITY and any(
-            w in lx.ANATOMY for w in words[index + 1 : index + 1 + lx.LATERALITY_WINDOW]
+        elif word in lx.LATERALITY and (
+            any(w in lx.ANATOMY for w in words[index + 1 : index + 1 + lx.LATERALITY_WINDOW])
+            or words[index + 1 : index + 2] == ["sided"]  # "right-sided"
         ):
             laterality.add(lx.LATERALITY[word])
         if word in lx.SEVERITY:
@@ -220,13 +228,14 @@ class RuleBasedConceptExtractor:
             text = sentence.text[first.start - sentence.start : last.end - sentence.start]
             return _Span(text, first.start, last.end)
 
-        clauses: list[_Span] = []
+        # (clause span, concept text when it differs from the written clause)
+        clauses: list[tuple[_Span, str | None]] = []
         pending: _Span | None = None  # qualifier-only fragment waiting for its condition
         for clause in _split(sentence.text, sentence.start, _CLAUSE_SPLIT_RE):
             if pending is not None:
                 clause, pending = merged(pending, clause), None
-            words = tokenize(clause.text)
-            if words and set(words) <= lx.QUALIFIER_WORDS:
+            content = set(tokenize(clause.text)) - lx.STOPWORDS
+            if content and content <= lx.QUALIFIER_WORDS:
                 pending = clause
             elif clauses and (
                 _QUALIFIER_START.match(clause.text)
@@ -236,19 +245,45 @@ class RuleBasedConceptExtractor:
                     and not re.fullmatch(r"(?:type|stage)\s*\w{1,4}", clause.text.strip(), re.I)
                 )
             ):
-                clauses[-1] = merged(clauses[-1], clause)
+                clauses[-1] = (merged(clauses[-1][0], clause), None)
+            elif (
+                clauses and content & _SITE_WORDS and content <= _SIDE_OR_SITE | lx.QUALIFIER_WORDS
+            ):
+                # A site-only fragment: "Arthritis of knee and hip" names arthritis of the hip
+                # too (the condition is repeated with the new site); "Lobar pneumonia, both
+                # lungs" qualifies the previous condition, which names no site of its own.
+                previous, override = clauses[-1]
+                head = _condition_head(override or previous.text)
+                if head:
+                    clauses.append((clause, f"{head} {clause.text}"))
+                else:
+                    clauses[-1] = (merged(previous, clause), None)
             else:
-                clauses.append(clause)
+                clauses.append((clause, None))
         if pending is not None:
-            clauses.append(pending)
-        for clause in clauses:
+            # A trailing qualifier ("Asthma, severe") belongs to the condition before it.
+            if clauses:
+                clauses[-1] = (merged(clauses[-1][0], pending), None)
+            else:
+                clauses.append((pending, None))
+        for clause, override in clauses:
             gap = sentence.text[previous_end - sentence.start : clause.start - sentence.start]
             previous_end = clause.end
             if lx.NEGATION_TERMINATORS.search(gap) or lx.NEW_STATEMENT.match(clause.text):
                 scoped, scoped_cue = None, None
-            concept = self._clause(clause, section, sentence_index, scoped, scoped_cue)
+            concept = self._clause(clause, section, sentence_index, scoped, scoped_cue, override)
             if concept is None:
                 continue
+            # "X or Y": a differential. Neither alternative is an established diagnosis.
+            if (
+                _OR_SEPARATOR.search(gap)
+                and results
+                and results[-1].status == AssertionStatus.DOCUMENTED
+                and concept.status == AssertionStatus.DOCUMENTED
+            ):
+                for item in (results[-1], concept):
+                    item.status = AssertionStatus.UNCERTAIN
+                    item.cues.append("or (differential)")
             # "History of X and Y": a history *prefix* scopes like negation does, so Y is never
             # silently promoted to a current diagnosis. ("former smoker" stays local.)
             scoping = concept.status in _SCOPING_STATUSES or (
@@ -268,8 +303,11 @@ class RuleBasedConceptExtractor:
         sentence_index: int,
         scoped: AssertionStatus | None,
         scoped_cue: str | None,
+        override: str | None = None,
     ) -> ClinicalConcept | None:
-        text = clause.text.strip(" .:-")
+        text = (override or clause.text).strip(" .:-")
+        if label := lx.LABEL_PREFIX.match(text):
+            text = text[label.end() :]
         cues: list[str] = []
         status: AssertionStatus | None = None
 
@@ -283,20 +321,30 @@ class RuleBasedConceptExtractor:
             family_text, cue = _strip_prefix(text, lx.FAMILY_PREFIXES)
             if cue is None and (match := lx.FAMILY_MEMBER.match(text)):
                 family_text, cue = text[match.end() :], match.group(0).strip()
-            if cue is not None or section == "family_history":
+            if cue is not None:
                 status, text = AssertionStatus.FAMILY_HISTORY, family_text
-                cues.append(cue or "family history section")
+                cues.append(cue)
         if status is None:
+            # Cues may follow a grammatical subject: "Patient denies X", "Pt has no X".
+            subject = lx.SUBJECT_PREFIX.match(text)
+            cue_text = text[subject.end() :] if subject else text
             for prefixes, value in (
                 (lx.NEGATION_PREFIXES, AssertionStatus.NEGATED),
                 (lx.UNCERTAIN_PREFIXES, AssertionStatus.UNCERTAIN),
                 (lx.SUSPECTED_PREFIXES, AssertionStatus.SUSPECTED),
             ):
-                stripped, cue = _strip_prefix(text, prefixes)
+                stripped, cue = _strip_prefix(cue_text, prefixes)
                 if cue is not None:
                     status, text = value, stripped
                     cues.append(cue)
                     break
+            if status is None and (match := lx.NEGATION_INFIX.match(cue_text)):
+                status, text = AssertionStatus.NEGATED, cue_text[match.end() :]
+                cues.append(match.group(1).lower())
+        if status is None and section == "family_history":
+            # After explicit cues: "Family history: ... Patient denies X" stays negated.
+            status = AssertionStatus.FAMILY_HISTORY
+            cues.append("family history section")
         if status is None:
             stripped, cue = _strip_prefix(text, lx.HISTORY_PREFIXES)
             first_word = (tokenize(text) or [""])[0]
@@ -324,16 +372,53 @@ class RuleBasedConceptExtractor:
             return None
         if all(w.isdigit() for w in words):
             return None
+        expansions = expand_abbreviations(text)
+        if (
+            status == AssertionStatus.HISTORY
+            and (former := _EX_PREFIX.sub("former ", text)) != text
+        ):
+            expansions.append(former)  # "ex-smoker" states "former smoker"
         return ClinicalConcept(
             text=text,
             concept_type=_concept_type(text, section),
             status=status or AssertionStatus.DOCUMENTED,
-            attributes=extract_attributes(text),
+            attributes=_attributes(text, expansions),
             section=section,
             sentence_index=sentence_index,
             start=clause.start,
             end=clause.end,
             evidence=clause.text,
             cues=cues,
-            expansions=expand_abbreviations(text),
+            expansions=expansions,
         )
+
+
+def _attributes(text: str, expansions: list[str]) -> ClinicalAttributes:
+    """Attributes of the text as written, completed by what an abbreviation states
+    ("T2DM" -> type 2, "CKD" -> chronic). The written text wins; nothing is duplicated."""
+    attributes = extract_attributes(text)
+    for variant in expansions:
+        extra = extract_attributes(variant)
+        for name, value in extra:
+            current = getattr(attributes, name)
+            if isinstance(current, list):
+                current.extend(v for v in value if v not in current)
+            elif current is None and value is not None and name not in attributes.conflicts:
+                setattr(attributes, name, value)
+    return attributes
+
+
+def _condition_head(text: str) -> str | None:
+    """The condition part of a clause that names a site: the text before its first side or
+    site word ("Arthritis of the left knee" -> "Arthritis of the"). None when the clause names
+    no site, or starts with one."""
+    for match in re.finditer(r"[A-Za-z]+", text):
+        if match.group(0).lower() in _SITE_WORDS:
+            break
+    else:
+        return None
+    for match in re.finditer(r"[A-Za-z]+", text):
+        if match.group(0).lower() in _SIDE_OR_SITE:
+            head = text[: match.start()].strip(" ,;-")
+            return head or None
+    return None

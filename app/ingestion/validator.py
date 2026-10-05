@@ -304,9 +304,10 @@ class ICD10CMValidator(BaseICDValidator):
 
 
 class SyntheticICDValidator(BaseICDValidator):
-    """Synthetic ICD-like test classification (SYNTH-ICD). Never real clinical content."""
+    """Synthetic ICD-like test classifications (SYNTH-ICD, and SYNTH-ALT for coding-system
+    isolation tests). Never real clinical content."""
 
-    coding_systems = ("SYNTH-ICD",)
+    coding_systems = ("SYNTH-ICD", "SYNTH-ALT")
     code_pattern = re.compile(r"^[A-Z][0-9]{2}(\.[0-9]{1,2})?$")
 
 

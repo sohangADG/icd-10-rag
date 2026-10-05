@@ -54,9 +54,9 @@ def test_every_adapter_reconstructs_the_same_classification(
     assert result.is_valid, [i.message for i in result.fatal_issues]
     assert _structure(result) == reference
     stats = result.statistics()
-    assert (stats["chapters"], stats["blocks"], stats["categories"]) == (4, 7, 13)
-    assert (stats["subcategories"], stats["codes"]) == (27, 4)
-    assert stats["index_terms"] == (18 if fmt in TERM_FORMATS else 0)
+    assert (stats["chapters"], stats["blocks"], stats["categories"]) == (5, 9, 16)
+    assert (stats["subcategories"], stats["codes"]) == (36, 4)
+    assert stats["index_terms"] == (20 if fmt in TERM_FORMATS else 0)
     assert result.metadata.coding_system == "SYNTH-ICD"
     assert result.metadata.source_sha256 == sha256_of_file(path)
     for record in result.records:
@@ -78,8 +78,9 @@ def test_versions_are_distinct(tmp_path: Path) -> None:
     v2025 = run_pipeline(*write_source(tmp_path, "json", "2025"))
     codes_2024 = {r.code for r in v2024.records}
     codes_2025 = {r.code for r in v2025.records}
-    assert codes_2025 - codes_2024 == {"A01.3"}
-    assert codes_2024 - codes_2025 == {"D00.2"}
+    # Added code and renamed block (A10 moved from A10-A19 to A10-A14); removed code.
+    assert codes_2025 - codes_2024 == {"A01.3", "A10-A14"}
+    assert codes_2024 - codes_2025 == {"D00.2", "A10-A19"}
     assert v2025.metadata.version == "2025"
 
 

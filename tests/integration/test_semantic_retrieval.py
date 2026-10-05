@@ -96,17 +96,17 @@ async def test_unchanged_documents_are_skipped_and_changed_ones_regenerated(
     indexer = SearchIndexer(session, fake_st())
     first = await indexer.embed_documents(dataset, batch_size=10)
     assert (first.documents, first.embedded, first.skipped_unchanged, first.batches) == (
-        55,
-        55,
+        70,
+        70,
         0,
-        6,
+        7,
     )
     assert await _spaces(session, dataset) == {
         ("sentence_transformers", "fake/semantic", 256, True)
     }
 
     again = await indexer.embed_documents(dataset)
-    assert (again.embedded, again.skipped_unchanged) == (0, 55)
+    assert (again.embedded, again.skipped_unchanged) == (0, 70)
 
     node = (
         await session.execute(
@@ -118,10 +118,10 @@ async def test_unchanged_documents_are_skipped_and_changed_ones_regenerated(
     await SearchIndexer(session).build_documents(dataset)
     changed = await indexer.embed_documents(dataset)
     # A00's own text changed, and so did the documents that show it in their hierarchy path.
-    assert changed.embedded == 4 and changed.skipped_unchanged == 51
+    assert changed.embedded == 4 and changed.skipped_unchanged == 66
 
     forced = await indexer.embed_documents(dataset, force=True)
-    assert forced.embedded == 55
+    assert forced.embedded == 70
 
 
 async def test_model_change_regenerates_and_isolates(
@@ -129,7 +129,7 @@ async def test_model_change_regenerates_and_isolates(
 ) -> None:
     await SearchIndexer(session, fake_st("fake/model-a")).embed_documents(dataset)
     switched = await SearchIndexer(session, fake_st("fake/model-b")).embed_documents(dataset)
-    assert switched.embedded == 55 and switched.skipped_unchanged == 0
+    assert switched.embedded == 70 and switched.skipped_unchanged == 0
     assert await _spaces(session, dataset) == {("sentence_transformers", "fake/model-b", 256, True)}
     settings = get_settings()
     old = await HybridRetriever(session, settings, fake_st("fake/model-a")).retrieve(
@@ -150,7 +150,7 @@ async def test_provider_change_is_isolated_even_with_same_model_name_and_dimensi
     )
     assert result.semantic_status is SemanticStatus.NOT_INDEXED
     regenerated = await SearchIndexer(session, impostor).embed_documents(dataset)
-    assert regenerated.embedded == 55
+    assert regenerated.embedded == 70
 
 
 # --- failures / validation ---
@@ -179,7 +179,7 @@ async def test_failed_batch_keeps_earlier_batches_and_retry_resumes(
     retry = await SearchIndexer(session, HashingEmbeddingProvider(256)).embed_documents(
         dataset, batch_size=10
     )
-    assert (retry.embedded, retry.skipped_unchanged) == (35, 20)
+    assert (retry.embedded, retry.skipped_unchanged) == (50, 20)
 
 
 async def test_malformed_dimensions_are_never_stored(
@@ -227,7 +227,7 @@ async def test_empty_search_document_is_skipped_without_blocking_semantic_search
         .values(semantic_text="   ")
     )
     stats = await SearchIndexer(session, HashingEmbeddingProvider(256)).embed_documents(dataset)
-    assert (stats.embedded, stats.skipped_empty) == (54, 1)
+    assert (stats.embedded, stats.skipped_empty) == (69, 1)
     result = await HybridRetriever(session, get_settings(), HashingEmbeddingProvider(256)).retrieve(
         dataset, ["airway infection"], top_k=3
     )
@@ -427,6 +427,10 @@ async def test_weak_evidence_is_reported_not_guessed(
     response = await SuggestionService(session, settings, None).suggest(request)
     assert response.suggestions == []
     (unmatched,) = response.unmatched_concepts
-    rejected = [r for c in unmatched.rejected_candidates for r in c["reasons"]]
-    assert unmatched.reason.startswith("No ") and rejected
-    assert all("Insufficient retrieval evidence" in r for r in rejected)
+    assert unmatched.reason.startswith("No ") and unmatched.rejected_candidates
+    # Every candidate is reported with the evidence gate among its reasons (the condition
+    # gate may add that "syndrome" alone does not name its condition).
+    assert all(
+        any("Insufficient retrieval evidence" in r for r in c["reasons"])
+        for c in unmatched.rejected_candidates
+    )
