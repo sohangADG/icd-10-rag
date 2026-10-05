@@ -160,3 +160,91 @@ cache. This shows the cache working; it is not a like-for-like latency compariso
 - Docker: `docker compose build` succeeds. The image has CPU-only torch `2.14.1+cpu` and
   sentence-transformers 6.1.0. The model lives in the external `hf-cache` volume (129 MB), and
   git tracks no model files.
+
+## 8. Phase 3 clinical evaluation (2026-10-05)
+
+Branch `feature/clinical-evaluation-hardening`, built on `feature/complete-icd-rag` @ `0123df7`.
+Docker, real model `BAAI/bge-small-en-v1.5`, fresh database `icd_rag_clinical`
+(`python -m scripts.clinical_evaluation_e2e`). **Synthetic data only; no real ICD-10-CA accuracy
+is claimed.** Method and definitions: [clinical-safety-evaluation.md](clinical-safety-evaluation.md).
+
+| Check | Result |
+|---|---|
+| Default suite | **418 passed**, 0 failed, 5 skipped (277 unit + 146 integration collected) |
+| Real-model suite | **5 passed** |
+| Ruff / format / `git diff --check` | clean / 162 files formatted / clean |
+| Runtime E2E (`scripts/runtime_e2e.py`) | **53/53** |
+| Clinical E2E (`scripts/clinical_evaluation_e2e.py`) | **41/41** checks; **safety gates PASS** |
+| Scenarios | 266 (61 abstention); **261 passed** |
+| API consistency | all 266 scenarios through `POST /api/v1/icd/suggest` match the service-level run |
+
+### Safety gates (all 0 = PASS)
+
+| Gate | Value | Gate | Value |
+|---|---|---|---|
+| unsupported-code rate | 0.000 (543 codes checked) | unsupported specificity rate | 0.000 |
+| cross-version contamination | 0 | negated/ruled-out returned as active | 0 |
+| coding-system contamination | 0 | family history returned as active | 0 |
+| non-READY dataset leakage | 0 | personal history returned as active | 0 |
+| fatal rule violations | 0 | must-not-return code returned | 0 |
+| invalid rule target codes | 0 / 120 | fabricated / incorrect evidence | 0 / 0 |
+
+### Stage metrics
+
+| Stage | Result |
+|---|---|
+| Concept extraction | precision 0.994, recall 1.000; assertion accuracy 1.000 (325 pairs); negation, ruled-out, history, family-history and uncertainty recall/precision 1.000; attribute accuracy 1.000 (106 checks) |
+| Retrieval R@1 / R@3 / R@5 / R@10 / MRR (228 queries) | hybrid 0.728 / 0.803 / 0.965 / 0.982 / 0.798; vector 0.750 / 0.825 / 0.965 / 0.987 / 0.820; lexical 0.671 / 0.706 / 0.882 / 0.908 / 0.729; fuzzy 0.425 / 0.605 / 0.750 / 0.754 / 0.545; index term 0.167 / 0.224 / 0.224 / 0.224 / 0.195; exact (code queries) 1.000 |
+| Reranking | top-1 0.740 before, 0.815 after; 58 improved, 4 degraded, 165 unchanged; 3 correct candidates removed (P05/P12 below the evidence gate, P06 symptom typing), 1 promoted (category E10 then resolved to the correct E10.9) |
+| Final selection | expected-code recall 0.982, code precision 1.000, exact code set 0.980, 0 false-positive codes, 0 duplicate suggestions |
+| Rules | detection 1.000 across CODE_FIRST 8, USE_ADDITIONAL_CODE 8, CODE_ALSO 6, INCLUDES 12, EXCLUDES 3, SEE 3, SEE_ALSO 2, NOTE 1; candidate-rejection accuracy 1.000; violation rate 0.000 |
+| Specificity | unsupported 0.000; safe fallback 1.000 (30 scenarios); missing-information recall 1.000, precision 1.000 |
+| Abstention | precision 0.941, recall 1.000, false-positive code rate 0.000 |
+| Confidence | HIGH 57 (precision 1.000), MEDIUM 73 (1.000), LOW 102 (1.000); 0 unjustified HIGH; near-ties are 26 LOW + 2 MEDIUM; incomplete specificity is 45 LOW + 32 MEDIUM |
+| Evidence | 778 items, traceability 1.000, provenance 1.000, 0 incorrect, 0 fabricated |
+
+Latency in ms (mean / p50 / p95) for the synthetic container, **not an SLA**:
+
+| Stage | mean / p50 / p95 |
+|---|---|
+| concept extraction | 0.33 / 0.28 / 0.56 |
+| retrieval | 260.9 / 126.4 / 654.5 |
+| reranking | 0.87 / 0.84 / 1.67 |
+| rule validation | 8.8 / 8.4 / 17.4 |
+| resolution + DB validation | 6.9 / 6.2 / 16.9 |
+| total | 283.3 / 141.3 / 682.2 |
+| HTTP round trip | 244.7 / 76.2 / 656.5 |
+
+HTTP checks:
+- **Success and abstention:** a normal suggestion returns 200; an abstention returns 200 with
+  no codes.
+- **Unresolvable datasets:** an invalid coding system gives 404, a wrong version 404, and
+  pending, validation-failed or archived datasets 409.
+- **Bad notes:** an empty or whitespace-only note gives 422, a note over
+  `CLINICAL_NOTE_MAX_CHARS` 422, and a note over the schema maximum 422.
+- **Long noisy note:** 7.4k characters are handled safely.
+- **Isolation:** SYNTH-ALT `A00` resolves to its own record.
+- **Semantic provider unavailable:** optional mode returns 200 (degraded); required mode returns
+  503.
+
+### Before the Phase 3 fixes (same scenarios)
+
+First run, before the fixes: safety gates **FAIL**.
+- **Safety failures:** negated/ruled-out returned as active 6, family history as active 1,
+  personal history as active 2, must-not-return codes 36.
+- **Pass and code metrics:** 202/266 passed; code precision 0.823; abstention recall 0.590,
+  false-positive code rate 0.177.
+- **Concept extraction:** precision 0.918, recall 0.963, assertion accuracy 0.965.
+
+That run also showed two evaluator defects, both corrected afterwards:
+- the specificity oracle compared a code with its immediate parent, not with the category;
+- concept matching ignored the clause as written.
+
+### Remaining failures (quality, not safety)
+
+| Scenario | Stage | Cause |
+|---|---|---|
+| paraphrase-10 (anaemia), paraphrase-11 (eczema) | ABSTENTION | semantic score of the small model below the evidence minimum |
+| paraphrase-03 (hay fever) | CONCEPT_EXTRACTION | "fever" types the concept as a symptom; a symptom is never coded on meaning-only evidence |
+| typo-10 ("athsma") | FUZZY_RETRIEVAL | transposition in a short word is not retrieved |
+| format-23 (administrative text only) | CONCEPT_EXTRACTION | administrative sentences outside an `Admin:` section are extracted as (uncoded) concepts |

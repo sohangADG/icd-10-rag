@@ -16,6 +16,8 @@ No code is ever produced that is not a row of the selected dataset.
 
 import logging
 import time
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -23,11 +25,12 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.clinical.extractor import ConceptExtractor, RuleBasedConceptExtractor
 from app.clinical.models import AssertionStatus, ClinicalConcept, ConceptType
+from app.coding.condition import condition_support
 from app.coding.reranker import Reranker, RerankFeatures
 from app.coding.rules import RuleEngine, RuleEvaluation
 from app.coding.specificity import SpecificityCheck, check_specificity
 from app.core.config import Settings
-from app.core.constants import CLASSIFICATION_NODE_TYPES, NodeStatus, TermType
+from app.core.constants import CLASSIFICATION_NODE_TYPES, NodeStatus, NodeType, TermType
 from app.core.exceptions import InvalidClinicalNoteError
 from app.core.text import normalize_text
 from app.indexing.embeddings import EmbeddingProvider
@@ -57,6 +60,31 @@ MEDIUM_CONFIDENCE = 0.35
 MIN_ALTERNATIVE_SCORE = 0.2
 _HISTORY_WORDS = ("history", "former", "previous")
 _UNCERTAIN = {AssertionStatus.UNCERTAIN, AssertionStatus.SUSPECTED}
+_STATUS_MENTIONS = {AssertionStatus.HISTORY, AssertionStatus.FAMILY_HISTORY}
+
+
+def _elapsed_ms(started: float) -> float:
+    return round((time.perf_counter() - started) * 1000, 3)
+
+
+class _StageClock:
+    """Accumulates elapsed time per stage into `timings` (no-op when it is None)."""
+
+    def __init__(self, timings: dict[str, float] | None) -> None:
+        self._timings = timings
+
+    @contextmanager
+    def __call__(self, stage: str) -> Iterator[None]:
+        if self._timings is None:
+            yield
+            return
+        started = time.perf_counter()
+        try:
+            yield
+        finally:
+            self._timings[stage] = round(
+                self._timings.get(stage, 0.0) + (time.perf_counter() - started) * 1000, 3
+            )
 
 
 @dataclass
@@ -68,6 +96,7 @@ class Evaluated:
     features: RerankFeatures
     rerank: float
     reject_reasons: list[str] = field(default_factory=list)
+    condition: str = "supported"  # app.coding.condition verdict (or "exempt")
 
     @property
     def node(self) -> IcdNode:
@@ -78,6 +107,50 @@ def _classification_parent(ancestors: list[IcdNode]) -> IcdNode | None:
     if ancestors and ancestors[-1].node_type in CLASSIFICATION_NODE_TYPES:
         return ancestors[-1]
     return None
+
+
+def _flag_conflicting_documentation(suggestions: list[Suggestion]) -> None:
+    """Two suggestions in the same category whose documented specificity contradicts (left vs
+    right lung, chronic vs acute on chronic) come from contradicting statements in the note
+    (copy-forward text, an imaging line...). Both are kept for the reviewer, never decided
+    here, and neither may be confident."""
+    by_category: dict[int, list[Suggestion]] = {}
+    for suggestion in suggestions:
+        suggestion.validation.setdefault("conflicting_documentation", [])
+        reference = suggestion.icd_reference
+        category = next(
+            (h["record_id"] for h in reference["hierarchy"] if h["level"] == NodeType.CATEGORY),
+            reference["record_id"],
+        )
+        by_category.setdefault(category, []).append(suggestion)
+    for group in by_category.values():
+        values: dict[str, dict[str, list[str]]] = {}
+        for suggestion in group:
+            for item in suggestion.validation["specificity"]["matched"]:
+                attribute, _, value = item.partition("=")
+                if value:
+                    values.setdefault(attribute, {}).setdefault(value, []).append(suggestion.code)
+        for attribute, by_value in values.items():
+            if len(by_value) < 2:
+                continue
+            codes = sorted({c for found in by_value.values() for c in found})
+            for suggestion in group:
+                if suggestion.code in codes:
+                    suggestion.confidence = "LOW"
+                    suggestion.validation["conflicting_documentation"].append(
+                        {
+                            "attribute": attribute,
+                            "values": sorted(by_value),
+                            "codes": codes,
+                            "message": "The note documents contradicting values for the same "
+                            "condition; review the documentation before coding.",
+                        }
+                    )
+
+
+def _category(node: IcdNode, ancestors: list[IcdNode]) -> IcdNode:
+    """The category a record belongs to (itself for a category). `ancestors` is root-first."""
+    return next((a for a in ancestors if a.node_type == NodeType.CATEGORY), node)
 
 
 def _own_terms(details: dict[str, Any]) -> tuple[list[str], list[str]]:
@@ -118,13 +191,19 @@ class SuggestionService:
             session, settings, provider, provider_status=provider_status
         )
         self._semantic: dict[str, Any] = {}
+        # Only a meaning-based provider can support a code that shares no word with the note.
+        self._meaning_based = provider is not None and provider.meaning_based
         self._extractor = extractor or RuleBasedConceptExtractor()
         self._reranker = reranker or Reranker()
         self._rules = RuleEngine()
 
     # --- public -------------------------------------------------------------------------------
 
-    async def suggest(self, request: SuggestRequest) -> SuggestResponse:
+    async def suggest(
+        self, request: SuggestRequest, *, trace: dict[str, Any] | None = None
+    ) -> SuggestResponse:
+        """`trace` (evaluation only): filled with per-stage outputs, rerank features and
+        timings for every concept. It never changes the result."""
         started = time.perf_counter()
         if len(request.clinical_note) > self._settings.clinical_note_max_chars:
             raise InvalidClinicalNoteError(
@@ -143,7 +222,11 @@ class SuggestionService:
             if request.include_uncertain is not None
             else self._settings.suggest_uncertain_concepts
         )
+        extraction_started = time.perf_counter()
         concepts = self._extractor.extract(request.clinical_note)
+        if trace is not None:
+            trace["extraction_ms"] = _elapsed_ms(extraction_started)
+            trace["concepts"] = []
         if self._settings.log_clinical_text:  # opt-in debugging only; refused in production
             logger.debug(
                 "extracted concepts",
@@ -151,9 +234,15 @@ class SuggestionService:
             )
         suggestions: list[Suggestion] = []
         unmatched: list[UnmatchedConcept] = []
-        for concept in concepts:
+        for index, concept in enumerate(concepts):
+            concept_trace: dict[str, Any] | None = None
+            if trace is not None:
+                concept_trace = {"concept_index": index, "timings_ms": {}}
+                trace["concepts"].append(concept_trace)
             reason = self._not_codable_reason(concept, include_uncertain)
             if reason:
+                if concept_trace is not None:
+                    concept_trace["not_codable"] = reason
                 unmatched.append(
                     UnmatchedConcept(
                         clinical_concept=concept.text,
@@ -163,13 +252,20 @@ class SuggestionService:
                 )
                 continue
             others = [c for c in concepts if c is not concept]
-            suggestion, miss = await self._suggest_for_concept(dataset, concept, others, top_k)
-            if suggestion is not None:
+            suggestion, miss = await self._suggest_for_concept(
+                dataset, concept, others, top_k, concept_trace
+            )
+            if suggestion is not None and all(
+                s.record_id != suggestion.record_id for s in suggestions
+            ):  # a repeated statement ("Severe asthma. Severe asthma.") is one suggestion
                 suggestions.append(suggestion)
             if miss is not None:
                 unmatched.append(miss)
 
+        _flag_conflicting_documentation(suggestions)
         duration = int((time.perf_counter() - started) * 1000)
+        if trace is not None:
+            trace["total_ms"] = _elapsed_ms(started)
         logger.info(
             "suggestion completed",
             extra={
@@ -239,7 +335,11 @@ class SuggestionService:
         top_k: int,
         trace: dict[str, Any] | None = None,
     ) -> tuple[Suggestion | None, UnmatchedConcept | None]:
+        timings: dict[str, float] | None = (
+            trace.setdefault("timings_ms", {}) if trace is not None else None
+        )
         filters = RetrievalFilters(node_types=CLASSIFICATION_NODE_TYPES)
+        retrieval_started = time.perf_counter()
         retrieval = await self._retriever.retrieve(
             dataset, queries_for(concept), top_k=CANDIDATE_POOL, filters=filters
         )
@@ -247,9 +347,13 @@ class SuggestionService:
             "semantic_status": retrieval.semantic_status.value,
             "embedding_space": retrieval.embedding_space,
         }
-        if trace is not None:
+        if trace is not None and timings is not None:
+            timings["retrieval_ms"] = _elapsed_ms(retrieval_started)
+            trace["queries"] = queries_for(concept)
+            trace["semantic_status"] = retrieval.semantic_status.value
             trace["retrieval_codes"] = [c.node.code for c in retrieval.candidates]
-        evaluated = await self._evaluate(dataset, concept, others, retrieval.candidates)
+            trace["retrieval_record_ids"] = [c.node.id for c in retrieval.candidates]
+        evaluated = await self._evaluate(dataset, concept, others, retrieval.candidates, timings)
 
         # Exclusion redirects ("Excludes: ... (B15)"): score the referenced code too.
         redirect_codes = {c for e in evaluated for c in e.rules.redirect_codes}
@@ -271,6 +375,7 @@ class SuggestionService:
                     concept,
                     others,
                     [c for c in extra.candidates if c.node.id in target_ids],
+                    timings,
                 )
 
         accepted = sorted(
@@ -281,6 +386,39 @@ class SuggestionService:
         if trace is not None:
             trace["reranked_codes"] = [e.node.code for e in accepted]
             trace["rejected_codes"] = [e.node.code for e in rejected]
+            trace["candidates"] = [
+                {
+                    "code": e.node.code,
+                    "record_id": e.node.id,
+                    "hybrid": e.candidate.hybrid_score,
+                    "scores": e.candidate.scores.as_dict(),
+                    "rerank": e.rerank,
+                    "features": e.features.as_dict(),
+                    "specificity": e.specificity.status,
+                    "missing": e.specificity.missing,
+                    "rule_status": e.rules.status,
+                    "reject_reasons": e.reject_reasons,
+                }
+                for e in evaluated
+            ]
+        resolution_started = time.perf_counter()
+        try:
+            return await self._select(dataset, concept, others, top_k, accepted, rejected, timings)
+        finally:
+            if timings is not None:
+                timings["resolution_ms"] = _elapsed_ms(resolution_started)
+
+    async def _select(
+        self,
+        dataset: IcdDataset,
+        concept: ClinicalConcept,
+        others: list[ClinicalConcept],
+        top_k: int,
+        accepted: list[Evaluated],
+        rejected: list[Evaluated],
+        timings: dict[str, float] | None,
+    ) -> tuple[Suggestion | None, UnmatchedConcept | None]:
+        """Hierarchy-aware resolution of the best accepted candidate + database validation."""
         for item in rejected:
             logger.info(
                 "candidate rejected by rules",
@@ -305,7 +443,7 @@ class SuggestionService:
                 clinical_concept=concept.text,
                 concept_status=concept.status.value,
                 reason="No candidate in this dataset is supported by the documentation."
-                if evaluated
+                if rejected
                 else "No matching record found in this dataset.",
                 rejected_candidates=rejected_out,
             )
@@ -317,9 +455,14 @@ class SuggestionService:
                 continue
             final, missing, resolution_alternatives, resolution = resolved
             # MANDATORY hallucination guard: the final code must be a row of this dataset.
+            validation_started = time.perf_counter()
             verified = await self._records.get_by_code(
                 dataset.id, final.code or "", classification_only=True
             )
+            if timings is not None:
+                timings["db_validation_ms"] = timings.get("db_validation_ms", 0.0) + _elapsed_ms(
+                    validation_started
+                )
             if (
                 verified is None
                 or verified.id != final.id
@@ -364,36 +507,54 @@ class SuggestionService:
         concept: ClinicalConcept,
         others: list[ClinicalConcept],
         candidates: list[RetrievalCandidate],
+        timings: dict[str, float] | None = None,
     ) -> list[Evaluated]:
+        """Rules, specificity and rerank features for each candidate. `timings` (evaluation
+        only) accumulates the time spent per stage."""
         if not candidates:
             return []
-        node_ids = {c.node.id for c in candidates} | {a.id for c in candidates for a in c.ancestors}
-        details = await self._records.details_of_many(dataset.id, sorted(node_ids))
-        target_codes = {
-            r.target_code for d in details.values() for r in d["rules"] if r.target_code
-        }
-        known_codes = await self._records.get_by_codes(dataset.id, sorted(target_codes))
+        clock = _StageClock(timings)
+        with clock("rule_data_ms"):
+            node_ids = {c.node.id for c in candidates} | {
+                a.id for c in candidates for a in c.ancestors
+            }
+            details = await self._records.details_of_many(dataset.id, sorted(node_ids))
+            target_codes = {
+                r.target_code for d in details.values() for r in d["rules"] if r.target_code
+            }
+            known_codes = await self._records.get_by_codes(dataset.id, sorted(target_codes))
         results: list[Evaluated] = []
         for candidate in candidates:
             node_details = details.get(candidate.node.id, {})
             own, inclusions = _own_terms(node_details)
             parent = _classification_parent(candidate.ancestors)
-            specificity = check_specificity(
-                concept, candidate.node.title, parent.title if parent else None, own
-            )
-            rules = self._rules.evaluate(
-                concept, others, candidate.node, candidate.ancestors, details, known_codes
-            )
-            features = self._reranker.features(
-                concept, candidate, own, inclusions, specificity, rules
-            )
+            category = _category(candidate.node, candidate.ancestors)
+            with clock("specificity_ms"):
+                # Baseline = the category: whatever the code adds beyond it, at any level
+                # (e.g. a subtype added by an intermediate subdivision), must be documented.
+                # A code written in the note is not documentation of the details it encodes.
+                specificity = check_specificity(
+                    concept,
+                    candidate.node.title,
+                    category.title if category is not candidate.node else None,
+                    own,
+                )
+            with clock("rules_ms"):
+                rules = self._rules.evaluate(
+                    concept, others, candidate.node, candidate.ancestors, details, known_codes
+                )
+            with clock("rerank_ms"):
+                features = self._reranker.features(
+                    concept, candidate, own, inclusions, specificity, rules
+                )
+                rerank = self._reranker.score(features)
             evaluated = Evaluated(
                 candidate=candidate,
                 parent=parent,
                 specificity=specificity,
                 rules=rules,
                 features=features,
-                rerank=self._reranker.score(features),
+                rerank=rerank,
             )
             if rules.rejected:
                 evaluated.reject_reasons += [
@@ -402,6 +563,10 @@ class SuggestionService:
             if specificity.contradicted:
                 evaluated.reject_reasons += specificity.conflicts
             evaluated.reject_reasons += self._status_gate(concept, candidate.node, own)
+            evaluated.condition, reasons = self._condition_gate(
+                concept, candidate, details, own, specificity, rules, features
+            )
+            evaluated.reject_reasons += reasons
             if not rules.inclusion_match and not self._has_evidence(candidate):
                 evaluated.reject_reasons.append(
                     "Insufficient retrieval evidence (no signal reaches the minimum: "
@@ -410,7 +575,68 @@ class SuggestionService:
                     f"{self._settings.suggestion_min_evidence:.2f})."
                 )
             results.append(evaluated)
+        # When the note's own words point to other conditions (candidates sharing words with
+        # it, all short of support), a meaning-only match to an unrelated category is a guess:
+        # "kidney disease" must not become a glucose-regulation code.
+        if any(e.condition == "partial" for e in results):
+            for item in results:
+                if item.condition == "none" and not item.reject_reasons:
+                    item.reject_reasons.append(
+                        "The documented words point to other conditions; meaning-only evidence "
+                        f"for {item.node.code} is not enough."
+                    )
         return results
+
+    def _condition_gate(
+        self,
+        concept: ClinicalConcept,
+        candidate: RetrievalCandidate,
+        details: dict[int, dict[str, Any]],
+        own: list[str],
+        specificity: SpecificityCheck,
+        rules: RuleEvaluation,
+        features: RerankFeatures,
+    ) -> tuple[str, list[str]]:
+        """(verdict, reject reasons). The documentation must name the candidate's condition
+        (app.coding.condition), not only share a word with it. An exact code, title or
+        source-term match settles it. A candidate sharing no word at all needs meaning-based
+        (semantic) evidence, and never for a history/family-history mention or a symptom (a
+        symptom never becomes the diagnosis that would explain it)."""
+        if (
+            candidate.scores.exact >= 1.0
+            or rules.inclusion_match
+            or features.exact_terminology
+            or specificity.supported_by_term
+        ):
+            return "exempt", []
+        texts = [candidate.node.title, *own]
+        for ancestor in candidate.ancestors:
+            if ancestor.node_type in CLASSIFICATION_NODE_TYPES:
+                texts += [ancestor.title, *_own_terms(details.get(ancestor.id, {}))[0]]
+        support = condition_support(concept, texts)
+        code = candidate.node.code
+        if support.verdict == "partial":
+            return support.verdict, [
+                f"The documented concept names a different or less specific condition than {code}."
+            ]
+        if support.verdict == "none":
+            if concept.status in _STATUS_MENTIONS:
+                return support.verdict, [
+                    "History/family-history mention: the documented condition does not match "
+                    f"{code}."
+                ]
+            if concept.concept_type == ConceptType.SYMPTOM:
+                return support.verdict, [
+                    f"Symptom: no documented word of {code}'s condition; a symptom is not "
+                    "coded as a diagnosis on meaning-only evidence."
+                ]
+            semantic = candidate.scores.semantic or 0.0
+            if not self._meaning_based or semantic < self._settings.suggestion_min_evidence:
+                return support.verdict, [
+                    f"No documented word of {code}'s condition, and no meaning-based (semantic) "
+                    "evidence."
+                ]
+        return support.verdict, []
 
     def _has_evidence(self, candidate: RetrievalCandidate) -> bool:
         """At least one retrieval signal is strong enough to support a suggestion.
@@ -500,10 +726,11 @@ class SuggestionService:
         target = best.node
         ancestors = list(best.candidate.ancestors)
         if not best.specificity.supported:
-            parent = _classification_parent(ancestors)
-            if parent is None:
+            fallback = await self._supported_ancestor(dataset, concept, ancestors)
+            if fallback is None:
                 return None  # never return an unsupported code
-            if await self._rejection_reasons(dataset, concept, others, parent, ancestors[:-1]):
+            parent, parent_ancestors = fallback
+            if await self._rejection_reasons(dataset, concept, others, parent, parent_ancestors):
                 return None
             alternatives.append(
                 Alternative(
@@ -516,7 +743,7 @@ class SuggestionService:
                     is_selectable=best.node.is_selectable,
                 )
             )
-            target, ancestors, resolution = parent, ancestors[:-1], "parent_fallback"
+            target, ancestors, resolution = parent, parent_ancestors, "parent_fallback"
         elif best.specificity.is_unspecified_variant and best.parent is not None:
             # An "unspecified" code is right when the detail is undocumented; say which detail
             # the specific siblings would need.
@@ -541,6 +768,26 @@ class SuggestionService:
                     else "parent_then_unspecified"
                 )
         return target, missing, alternatives, resolution
+
+    async def _supported_ancestor(
+        self, dataset: IcdDataset, concept: ClinicalConcept, ancestors: list[IcdNode]
+    ) -> tuple[IcdNode, list[IcdNode]] | None:
+        """Nearest classification ancestor whose own specificity (beyond its category) is
+        documented: falling back from C00.10 skips C00.1 ("type 1" undocumented) and lands on
+        the category C00. Returns (ancestor, its ancestors) or None."""
+        classification = [a for a in ancestors if a.node_type in CLASSIFICATION_NODE_TYPES]
+        if not classification:
+            return None
+        category = _category(classification[0], ancestors)
+        details = await self._records.details_of_many(dataset.id, [a.id for a in classification])
+        for node in reversed(classification):
+            own, _ = _own_terms(details.get(node.id, {}))
+            if (
+                node is category
+                or check_specificity(concept, node.title, category.title, own).supported
+            ):
+                return node, ancestors[: ancestors.index(node)]
+        return None
 
     async def _descend(
         self,
@@ -574,7 +821,9 @@ class SuggestionService:
                 continue
             if self._rules.evaluate(concept, others, child, lineage, details, known_codes).rejected:
                 continue
-            check = check_specificity(concept, child.title, node.title, own)
+            check = check_specificity(
+                concept, child.title, _category(node, node_ancestors).title, own
+            )
             if check.supported:
                 supported.append((child, check))
             elif not check.contradicted:

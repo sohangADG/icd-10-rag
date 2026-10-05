@@ -39,7 +39,7 @@ async def test_dataset_endpoints(client: AsyncClient) -> None:
     ).json()
     assert [d["version"] for d in listing["datasets"]] == ["2024"]
     detail = (await client.get(f"/api/v1/icd/datasets/{client.dataset_id}")).json()
-    assert detail["status"] == "ready" and detail["record_counts"]["SUBCATEGORY"] == 27
+    assert detail["status"] == "ready" and detail["record_counts"]["SUBCATEGORY"] == 36
     assert detail["licence"]["basis"] == "synthetic"
     assert detail["latest_ingestion"]["status"] == "completed"
     missing = await client.get("/api/v1/icd/datasets/999999")
@@ -156,7 +156,7 @@ async def test_admin_reindex_and_archive_with_token(client: AsyncClient) -> None
     reindex = await client.post(
         f"/api/v1/admin/datasets/{client.dataset_id}/reindex", headers=headers
     )
-    assert reindex.status_code == 200 and reindex.json()["documents"] == 55
+    assert reindex.status_code == 200 and reindex.json()["documents"] == 70
     archived = await client.post(
         f"/api/v1/admin/datasets/{client.dataset_id}/archive", headers=headers
     )

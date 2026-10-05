@@ -32,6 +32,7 @@ KEYED = 10  # dimensions 0..9 are reserved for one-hot "concepts"
 class KeywordProvider(HashingEmbeddingProvider):
     provider_name: ClassVar[str] = "keyword_test"
     default_similarity_floor: ClassVar[float] = 0.5
+    meaning_based: ClassVar[bool] = True  # an engineered "meaning" space
 
     def __init__(self, rules: list[tuple[str, str, int]]) -> None:
         """rules: (document code prefix, query phrase, direction index)."""
@@ -70,7 +71,7 @@ async def dataset(session: AsyncSession, tmp_path: Path) -> IcdDataset:
 async def _embedded(session: AsyncSession, dataset: IcdDataset, rules) -> KeywordProvider:  # noqa: ANN001
     provider = KeywordProvider(rules)
     stats = await SearchIndexer(session, provider).embed_documents(dataset)
-    assert stats.embedded == 55
+    assert stats.embedded == 70
     # Engineered one-hot vectors are pathological for an approximate HNSW graph (mostly
     # orthogonal points), and these tests check pipeline logic, not ANN recall: use an exact
     # scan. (The index is created inside the test transaction and rolled back with it.)
@@ -172,3 +173,35 @@ async def test_raw_provider_exception_degrades_or_fails_by_mode(
         await HybridRetriever(session, required, ExplodingProvider(256)).retrieve(
             dataset, ["hypertension"], top_k=3
         )
+
+
+# --- meaning-only evidence (Phase 3 clinical evaluation: symptom-11, ambiguous-03) ---
+
+
+async def test_meaning_only_match_is_accepted_when_nothing_contradicts_it(
+    session: AsyncSession, dataset: IcdDataset
+) -> None:
+    provider = await _embedded(session, dataset, [("C13", "zzrenal", 0)])
+    response = await _suggest(session, provider, "Assessment: zzrenal.")
+    assert [s.code for s in response.suggestions] == ["C13"]
+
+
+async def test_meaning_only_match_is_rejected_when_the_notes_words_point_elsewhere(
+    session: AsyncSession, dataset: IcdDataset
+) -> None:
+    # "kidney" is shared with C12/C13 (rejected: chronic/acute undocumented); a perfect
+    # meaning-only match to an unrelated category must not win by default.
+    provider = await _embedded(session, dataset, [("C00.9", "kidney disease", 0)])
+    response = await _suggest(session, provider, "Kidney disease.")
+    assert response.suggestions == []
+
+
+async def test_a_symptom_is_never_coded_on_meaning_only_evidence(
+    session: AsyncSession, dataset: IcdDataset
+) -> None:
+    provider = await _embedded(session, dataset, [("C13", "fatigue", 0)])
+    response = await _suggest(session, provider, "Fatigue.")
+    assert response.suggestions == []
+    (unmatched,) = response.unmatched_concepts
+    reasons = [r for c in unmatched.rejected_candidates for r in c["reasons"]]
+    assert any("Symptom" in r for r in reasons)

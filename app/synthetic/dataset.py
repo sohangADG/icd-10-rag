@@ -423,6 +423,104 @@ CHAPTERS_2024: list[dict[str, Any]] = [
             },
         ],
     },
+    # Anatomical-site, encounter and cause specificity (clinical-evaluation scenarios).
+    {
+        "code": "V",
+        "level": "CHAPTER",
+        "title": "Synthetic joint, bone and skin conditions",
+        "range": ["E00", "E19"],
+        "children": [
+            {
+                "code": "E00-E09",
+                "level": "BLOCK",
+                "title": "Joint and bone conditions",
+                "range": ["E00", "E09"],
+                "children": [
+                    {
+                        "code": "E00",
+                        "level": "CATEGORY",
+                        "title": "Joint inflammation",
+                        "synonyms": ["arthritis"],
+                        "inclusions": ["inflamed joint"],
+                        "children": [
+                            {
+                                "code": "E00.0",
+                                "level": "SUBCATEGORY",
+                                "title": "Joint inflammation of knee",
+                            },
+                            {
+                                "code": "E00.1",
+                                "level": "SUBCATEGORY",
+                                "title": "Joint inflammation of hip",
+                            },
+                            {
+                                "code": "E00.9",
+                                "level": "SUBCATEGORY",
+                                "title": "Joint inflammation, unspecified site",
+                            },
+                        ],
+                    },
+                    {
+                        "code": "E01",
+                        "level": "CATEGORY",
+                        "title": "Fracture of forearm bone",
+                        "synonyms": ["broken forearm"],
+                        "notes": [
+                            "An encounter detail (initial, subsequent or sequela) is required for "
+                            "this category."
+                        ],
+                        "children": [
+                            {
+                                "code": "E01.0",
+                                "level": "SUBCATEGORY",
+                                "title": "Fracture of forearm bone, initial encounter",
+                            },
+                            {
+                                "code": "E01.1",
+                                "level": "SUBCATEGORY",
+                                "title": "Fracture of forearm bone, subsequent encounter",
+                            },
+                            {
+                                "code": "E01.2",
+                                "level": "SUBCATEGORY",
+                                "title": "Fracture of forearm bone, sequela",
+                            },
+                        ],
+                    },
+                ],
+            },
+            {
+                "code": "E10-E19",
+                "level": "BLOCK",
+                "title": "Skin and wound conditions",
+                "range": ["E10", "E19"],
+                "children": [
+                    {
+                        "code": "E10",
+                        "level": "CATEGORY",
+                        "title": "Skin wound infection",
+                        "children": [
+                            {
+                                "code": "E10.0",
+                                "level": "SUBCATEGORY",
+                                "title": "Skin wound infection due to animal bite",
+                            },
+                            {
+                                "code": "E10.1",
+                                "level": "SUBCATEGORY",
+                                "title": "Skin wound infection due to foreign body",
+                            },
+                            {
+                                "code": "E10.9",
+                                "level": "SUBCATEGORY",
+                                "title": "Skin wound infection, unspecified cause",
+                            },
+                        ],
+                    },
+                ],
+            },
+        ],
+    },
 ]
 
 RULE_LIST_FIELDS = (
@@ -448,7 +546,14 @@ def _find(chapters: list[dict[str, Any]], code: str) -> tuple[list[dict[str, Any
 
 
 def chapters_2025() -> list[dict[str, Any]]:
-    """Version 2025: one added code, one retitled code, one removed code."""
+    """Version 2025, with deliberate differences from 2024 (version-isolation tests):
+
+    * added code A01.3; removed code D00.2; retitled code B00.9;
+    * changed parent: A10 moves from block A10-A19 to the new block A10-A14;
+    * changed rule: B01 "code first B00.0" becomes "code also C12.-";
+    * changed inclusion: A00.1 "long-standing" becomes "persistent airway infection";
+    * changed exclusion: A10 excludes cough due to the wheezing disorder, not to infection.
+    """
     chapters = copy.deepcopy(CHAPTERS_2024)
     siblings, index = _find(chapters, "A01.2")
     siblings.insert(
@@ -459,6 +564,17 @@ def chapters_2025() -> list[dict[str, Any]]:
     siblings[index]["title"] = "Elevated blood pressure disorder without organ involvement"
     siblings, index = _find(chapters, "D00.2")
     del siblings[index]
+
+    siblings, index = _find(chapters, "A10-A19")
+    block = siblings[index]
+    block.update(code="A10-A14", title="Cough disorders", range=["A10", "A14"])
+    siblings, index = _find(chapters, "B01")
+    del siblings[index]["code_first"]
+    siblings[index]["code_also"] = ["Code also chronic kidney impairment, if present (C12.-)"]
+    siblings, index = _find(chapters, "A00.1")
+    siblings[index]["inclusions"] = ["persistent airway infection"]
+    siblings, index = _find(chapters, "A10")
+    siblings[index]["exclusions"] = ["cough due to wheezing airway disorder (A02.-)"]
     return chapters
 
 

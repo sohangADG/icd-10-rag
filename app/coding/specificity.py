@@ -15,7 +15,7 @@ import re
 from dataclasses import dataclass, field
 
 from app.clinical.lexicons import ANATOMY, LATERALITY, SEVERITY
-from app.clinical.models import ClinicalConcept
+from app.clinical.models import AssertionStatus, ClinicalConcept
 from app.core.text import normalize_text, tokenize
 
 _GENERIC_STOP = frozenset(
@@ -84,11 +84,20 @@ class SpecificityCheck:
         return "supported" if self.supported else "unsupported"
 
 
+_STATUS_WORDS = {
+    AssertionStatus.HISTORY: {"personal", "history", "past", "former", "previous"},
+    AssertionStatus.FAMILY_HISTORY: {"family", "history"},
+}
+
+
 def _concept_words(concept: ClinicalConcept) -> set[str]:
-    words = stems(concept.text)
+    """Words the documentation states: the concept, its abbreviation expansions, the clause as
+    written (status cues such as "current" are stripped from the concept text but are still
+    documentation) and the words its assertion status stands for ("personal history")."""
+    words = stems(concept.text) | stems(concept.evidence)
     for variant in concept.expansions:
         words |= stems(variant)
-    return words
+    return words | _STATUS_WORDS.get(concept.status, set())
 
 
 def check_specificity(
@@ -201,7 +210,8 @@ def check_specificity(
 
     if encounter := [t for t in added if t in _ENCOUNTER_WORDS]:
         require("encounter", encounter[0].rstrip("e"), attrs.encounter)
-        covered |= set(encounter)
+        # "initial encounter" / "initial visit": the encounter attribute covers the wording.
+        covered |= set(encounter) | {"encounter", "visit"}
 
     for token in added:
         site = ANATOMY.get(token)

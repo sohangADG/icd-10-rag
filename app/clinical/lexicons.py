@@ -39,15 +39,33 @@ SECTION_HEADERS: dict[str, str] = {
     "physical exam": "exam",
     "examination": "exam",
     "findings": "findings",
+    "admin": "administrative",
+    "administrative": "administrative",
+    "billing": "administrative",
 }
 # Sections whose content is not a list of conditions to code.
-SKIPPED_SECTIONS = {"plan", "medications", "allergies"}
+SKIPPED_SECTIONS = {"plan", "medications", "allergies", "administrative"}
 
 # (regex, status) — checked in order; first match wins. All anchored to clause start or end.
 RULED_OUT_PATTERNS = [
     re.compile(r"\b(?:was|were|has been|been)?\s*ruled\s+out\b", re.I),
     re.compile(r"^\s*(?:excluded)\b", re.I),
+    # "AKI excluded", "Diabetes was excluded" (cue after the condition)
+    re.compile(r"\s*\b(?:is|was|were|has been|have been)?\s*excluded\s*$", re.I),
 ]
+# A negative finding after a short lead-in: "Workup negative for X", "Echo shows no evidence
+# of X" (at most three lead-in words; the condition follows the cue).
+NEGATION_INFIX = re.compile(
+    r"^(?:[\w/-]+\s+){1,3}?(negative for|no evidence of|no signs? of|without evidence of)\s+",
+    re.I,
+)
+# Grammatical subject before a cue ("Patient denies X", "Pt has no X").
+SUBJECT_PREFIX = re.compile(
+    r"^(?:(?:the\s+)?(?:patient|pt|he|she)\s+)?(?:(?:has|have|had)\s+(?=(?:no|not)\b))?", re.I
+)
+# A short label before a colon that is not a known section header ("Dx: CHF",
+# "CXR: no consolidation", "Copied from prior note: ..."): not part of the concept.
+LABEL_PREFIX = re.compile(r"^[A-Za-z][\w/'-]*(?:\s+[\w/'-]+){0,3}\s*:\s+(?=\S)")
 NEGATION_PREFIXES = [
     "no evidence of",
     "no signs of",
@@ -109,7 +127,7 @@ HISTORY_PREFIXES = [
     "status post",
     "s/p",
 ]
-HISTORY_WORDS = {"former", "previous", "prior", "resolved", "remote"}
+HISTORY_WORDS = {"former", "previous", "prior", "resolved", "remote", "ex", "quit"}
 NEGATION_TERMINATORS = re.compile(r"\b(?:but|however|although|except|aside from)\b", re.I)
 # A clause that starts a new statement ("... and the patient has X") ends any scoped cue.
 NEW_STATEMENT = re.compile(
@@ -227,9 +245,8 @@ ABSENCE_PATTERN = re.compile(
     r"[a-z]+ (?:complication|involvement))\b|\buncomplicated\b",
     re.I,
 )
-CAUSE_PATTERN = re.compile(
-    r"\b(?:due to|secondary to|caused by|because of|from)\s+(.+?)(?=$|,|;)", re.I
-)
+# "from" is deliberately not a cue: "copied from prior note", "discharged from hospital".
+CAUSE_PATTERN = re.compile(r"\b(?:due to|secondary to|caused by|because of)\s+(.+?)(?=$|,|;)", re.I)
 ANATOMY = {
     "lung": "lung",
     "lungs": "lung",
@@ -290,6 +307,10 @@ ANATOMY = {
 # ("left lower lobe", "left knee"), never on their own ("patient left the clinic").
 LATERALITY_WINDOW = 3
 SYMPTOMS = {
+    "tired",
+    "tiredness",
+    "lethargy",
+    "chills",
     "pain",
     "ache",
     "fever",
